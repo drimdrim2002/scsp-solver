@@ -106,13 +106,13 @@ def test_presolve_maps_back():
         assert a.obj == pytest.approx(b.obj)
 
 
-def test_unsupported_models_are_rejected():
+def test_non_covering_models_take_the_general_path():
     sp = generate_sp(n_rows=20, n_cols=100, seed=1)
-    with pytest.raises(NotImplementedError):
-        scsp.solve(sp, time_limit=0.1)
-    m = Model.from_rows("ge", [1.0, 1.0], [[0, 1]], "G", side=[([0, 1], [1.0, 1.0], "G", 1.0)])
-    with pytest.raises(NotImplementedError):
-        scsp.solve(m, time_limit=0.1)
+    res = scsp.solve(sp, time_limit=5.0)
+    assert res.stats["path"] == "bin" and res.status == "optimal" and res.verified
+    m = Model.from_rows("ge", [1.0, 1.0], [[0, 1]], "G", side=[([0, 1], [1.0, 1.0], "G", 2.0)])
+    res = scsp.solve(m, time_limit=1.0)
+    assert res.stats["path"] == "bin" and res.status == "optimal" and res.obj == pytest.approx(2.0)
 
 
 def test_infeasible_model():

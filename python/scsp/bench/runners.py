@@ -299,7 +299,7 @@ def run_scsp(model: Model, time_limit: float, threads: int = 4, seed: int = 0, w
     """Our own solver. Trace times are shifted so that they count from the call of
     the native solver, including the conversion of the model."""
     from .. import _core
-    from ..solve import _warm_indices, solve, supported
+    from ..solve import _warm_indices, solve
 
     options = dict(options or {})
     res = RunResult(
@@ -307,11 +307,6 @@ def run_scsp(model: Model, time_limit: float, threads: int = 4, seed: int = 0, w
         instance=model.name, n_cols=model.n_cols, n_cons=model.n_cons, time_limit=time_limit,
         threads=threads, seed=seed, warm_start=warm_start is not None, options=options,
     )
-    why = supported(model)
-    if why is not None:
-        res.status = "skipped"
-        res.note = why
-        return res
     if warm_start is not None:
         _warm_vector(model, warm_start)                  # raises if infeasible
     t0 = time.perf_counter()
@@ -345,6 +340,8 @@ CONFIGS = {
     # same heuristic setting as the DMS competition code (HighsSP.py)
     "highs-dms": (run_highs, {"mip_heuristic_effort": 0.3}),
     "scsp": (run_scsp, {}),
+    # the P1 heuristic alone (no root LP, no branch and bound); only covering models
+    "scsp-p1": (run_scsp, {"bnb": False}),
 }
 
 

@@ -1,11 +1,15 @@
-"""Python entry point of the solver (P1: set covering heuristic).
+"""Python entry point of the solver.
 
     res = scsp.solve(model, time_limit=10.0, threads=4, seed=1, warm_start=x0)
     res.x, res.obj, res.bound, res.gap, res.status, res.trace
 
-P1 supports models whose set rows are all covering rows (>= 1) and whose side
-constraints are all of the form  sum a x <= b  with a >= 0 (the DMS rider
-constraints). Anything else raises NotImplementedError until P3.
+Two paths (res.stats["path"]):
+- "sc": models whose set rows are all covering rows (>= 1) and whose side constraints are all
+  sum a x <= b with a >= 0 (the DMS rider constraints). Lagrangian heuristic on most threads,
+  root LP and LP-based branch and bound on one (P1 + P3).
+- "bin": every other model (partitioning or packing rows, other side constraints, negative
+  costs). LP-based branch and bound with Ryan-Foster branching for pure partitioning, on one
+  thread (P3).
 """
 from __future__ import annotations
 
@@ -32,7 +36,7 @@ class Result:
 
 
 def supported(model: Model) -> str | None:
-    """None if P1 can solve the model, else the reason it cannot."""
+    """None if the set covering path can take the model, else the reason it goes to the general 0-1 path."""
     if model.n_rows and not np.all(model.row_sense == COVER):
         return "set rows other than >= 1 (partitioning/packing) need the LP-based path (P3)"
     if model.n_side and not np.all(model.side_sense == PACK):
@@ -55,24 +59,40 @@ def _warm_indices(model: Model, warm_start) -> np.ndarray | None:
 
 def solve(model: Model, time_limit: float = 10.0, threads: int = 4, seed: int = 1, warm_start=None,
           mip_gap: float = 0.0, trace: bool = True, presolve: bool = True, local_search: bool = True,
-          enumerate: bool = True, verify: bool = True) -> Result:
-    """Solve a set covering model. `warm_start` is a 0/1 vector or a list of column
-    indices; the returned solution is never worse than a feasible warm start."""
-    why = supported(model)
-    if why is not None:
-        raise NotImplementedError(f"{model.name}: {why}")
+          enumerate: bool = True, bnb: bool = True, verify: bool = True) -> Result:
+    """Solve a set covering / partitioning model. `warm_start` is a 0/1 vector or a list of
+    column indices; the returned solution is never worse than a feasible warm start.
+
+    Covering models (>= 1 rows, <= side constraints) go to the set covering solver: the
+    Lagrangian heuristic on most threads plus LP-based branch and bound on one. Every other
+    model (partitioning or packing rows, other side constraints) goes to the general 0-1
+    path, which is LP-based branch and bound on one thread.
+    """
     warm = _warm_indices(model, warm_start)
     warm_ok = False
     if warm is not None:
         x0 = np.zeros(model.n_cols)
         x0[warm] = 1.0
         warm_ok = model.is_feasible(x0)
-    r = _core.solve_sc(
-        model.cost, model.row_ptr, model.col_idx, model.side_ptr, model.side_idx, model.side_val, model.side_rhs,
-        offset=float(model.obj_offset), time_limit=float(time_limit), threads=int(threads), seed=int(seed),
-        mip_gap=float(mip_gap), warm=warm.tolist() if warm_ok else None,
-        presolve=presolve, local_search=local_search, enumerate=enumerate,
-    )
+    if supported(model) is None:
+        r = _core.solve_sc(
+            model.cost, model.row_ptr, model.col_idx, model.side_ptr, model.side_idx, model.side_val, model.side_rhs,
+            offset=float(model.obj_offset), time_limit=float(time_limit), threads=int(threads), seed=int(seed),
+            mip_gap=float(mip_gap), warm=warm.tolist() if warm_ok else None,
+            presolve=presolve, local_search=local_search, enumerate=enumerate, bnb=bnb,
+        )
+        path = "sc"
+    else:
+        a, lower, upper = model.to_scipy()
+        a = a.tocsr()
+        a.sort_indices()
+        r = _core.solve_bin(
+            model.cost, a.indptr.astype(np.int64), a.indices.astype(np.int32), a.data.astype(np.float64),
+            np.ascontiguousarray(lower, dtype=np.float64), np.ascontiguousarray(upper, dtype=np.float64),
+            offset=float(model.obj_offset), time_limit=float(time_limit), threads=int(threads), seed=int(seed),
+            mip_gap=float(mip_gap), warm=warm.tolist() if warm_ok else None,
+        )
+        path = "bin"
     cols = np.asarray(r["cols"], dtype=np.int64)
     obj, bound = r["obj"], r["bound"]
     x = None
@@ -88,6 +108,7 @@ def solve(model: Model, time_limit: float = 10.0, threads: int = 4, seed: int = 
     if obj is not None and bound is not None:
         gap = 0.0 if obj == bound else (float("inf") if obj == 0 else max(0.0, (obj - bound) / abs(obj)))
     stats = dict(r["stats"])
+    stats["path"] = path
     stats["warm_given"] = warm is not None
     stats["warm_feasible"] = warm_ok
     return Result(status=r["status"], x=x, cols=cols, obj=obj, bound=bound, gap=gap, runtime=r["runtime"],

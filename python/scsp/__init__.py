@@ -5,8 +5,8 @@ the P1 set covering heuristic (`scsp.solve`, `scsp.dms.solveSP`) and the P2 LP e
 (`scsp.solve_lp`).
 """
 from ._core import __version__, build_info, hardware_threads, parallel_sum, version
-from .lp import LPResult, solve_lp
+from .lp import LpSolver, LPResult, solve_lp
 from .model import Model
 from .solve import Result, solve
 
-__all__ = ["Model", "Result", "LPResult", "solve", "solve_lp", "__version__", "build_info", "hardware_threads", "parallel_sum", "version"]
+__all__ = ["Model", "Result", "LPResult", "LpSolver", "solve", "solve_lp", "__version__", "build_info", "hardware_threads", "parallel_sum", "version"]

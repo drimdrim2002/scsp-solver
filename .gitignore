@@ -19,3 +19,6 @@ benchmarks/instances/
 
 # raw solver logs (traces and summaries are tracked, logs are not)
 benchmarks/results/**/*.log
+
+# local virtual environments
+.venv*/

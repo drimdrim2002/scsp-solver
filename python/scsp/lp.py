@@ -1,4 +1,5 @@
-"""LP relaxation of a Model, solved by the native LP engine (P2).
+"""LP relaxation of a Model, solved by the native LP engine (P2), and the LP that stays
+loaded for branch and bound (`LpSolver`, P3).
 
     res = scsp.solve_lp(model)                       # 0 <= x <= 1 relaxation
     res.status, res.obj, res.x, res.row_dual, res.red_cost, res.stats
@@ -44,6 +45,43 @@ def solve_lp_arrays(cost, a_csr, row_lo, row_up, col_lb, col_ub, offset: float =
     return LPResult(status=out["status"], obj=out["obj"] if ok else None, x=out["x"] if ok else None,
                     row_dual=out["row_dual"] if ok else None, red_cost=out["red_cost"] if ok else None,
                     runtime=out["runtime"], stats=dict(out["stats"]))
+
+
+class LpSolver(_core.LpSolver):
+    """An LP that stays loaded (the interface branch and bound uses).
+
+        lp = scsp.LpSolver(model)                 # LP relaxation, 0 <= x <= 1
+        lp.solve()                                # "optimal" | "infeasible" | "unbounded" | "limit" | "failed" | "cutoff"
+        lp.obj, lp.x, lp.red_cost, lp.row_dual()
+        lp.set_col_bounds(j, 1.0, 1.0)            # fix a column; the next solve() continues from the last basis
+        basis = lp.get_basis(); lp.set_basis(basis)
+        lp.set_cutoff(z)                          # solve() returns "cutoff" once the dual objective exceeds z
+
+    add_rows / remove_rows (cutting planes) raise NotImplementedError until P4.
+    """
+
+    def __init__(self, model: Model, seed: int = 1, time_limit: float | None = None):
+        a, lower, upper = model.to_scipy()
+        n = model.n_cols
+        self._init_arrays(model.cost, a, lower, upper, np.zeros(n), np.ones(n), model.obj_offset, seed, time_limit)
+
+    def _init_arrays(self, cost, a_csr, row_lo, row_up, col_lb, col_ub, offset, seed, time_limit):
+        a = a_csr.tocsr()
+        a.sort_indices()
+        _core.LpSolver.__init__(
+            self, np.ascontiguousarray(cost, dtype=np.float64), a.indptr.astype(np.int64), a.indices.astype(np.int32),
+            a.data.astype(np.float64), np.ascontiguousarray(row_lo, dtype=np.float64),
+            np.ascontiguousarray(row_up, dtype=np.float64), np.ascontiguousarray(col_lb, dtype=np.float64),
+            np.ascontiguousarray(col_ub, dtype=np.float64), float(offset), int(seed),
+            1e30 if time_limit is None else float(time_limit))
+
+    @classmethod
+    def from_arrays(cls, cost, a_csr, row_lo, row_up, col_lb, col_ub, offset: float = 0.0, seed: int = 1,
+                    time_limit: float | None = None) -> "LpSolver":
+        """min cost'x + offset  s.t. row_lo <= A x <= row_up, col_lb <= x <= col_ub (A: scipy CSR)."""
+        self = cls.__new__(cls)
+        self._init_arrays(cost, a_csr, row_lo, row_up, col_lb, col_ub, offset, seed, time_limit)
+        return self
 
 
 def solve_lp(model: Model, method: str = "auto", time_limit: float | None = None, **kw) -> LPResult:

@@ -1,5 +1,6 @@
-// Set covering heuristic of P1: Lagrangian (three-phase) engine, local search,
-// packing side constraints, optional enumeration with Lagrangian bounds.
+// Set covering solver: the P1 heuristic (Lagrangian three-phase engine, local search,
+// packing side constraints, enumeration with Lagrangian bounds) plus, from P3 on, one
+// thread that solves the root LP and runs LP-based branch and bound for the proof.
 #pragma once
 
 #include <cstdint>
@@ -18,6 +19,7 @@ struct SolveOptions {
   bool presolve = true;
   bool local_search = true;
   bool enumerate = true;
+  bool bnb = true;           // one thread runs the root LP and LP-based branch and bound (P3)
 };
 
 struct TracePoint {
@@ -39,6 +41,11 @@ struct SolveResult {
   double presolve_time = 0.0;
   long long sub_iters = 0, greedy_calls = 0, ls_moves = 0, enum_nodes = 0, passes = 0;
   bool warm_used = false;
+  // LP-based branch and bound (P3)
+  std::string bnb_status;    // "" (not run) | exhausted | stopped | failed | lp_infeasible
+  double lp_root = 0.0, lp_root_time = 0.0;   // root LP value of the reduced problem (NaN if not solved)
+  long long bnb_nodes = 0, bnb_lp_iters = 0, bnb_strong = 0;
+  int bnb_cols = 0;
 };
 
 // `warm`: optional feasible solution (original column indices). The returned

@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -58,5 +59,45 @@ struct LpResult {
 };
 
 LpResult solve_lp(const LpProblem& p, const LpOptions& opt);
+
+// An LP that stays loaded: change bounds, solve again from the last basis with the
+// dual simplex (the basis stays dual feasible under bound changes), save and restore
+// a basis. Used by branch and bound.
+class LpSolver {
+ public:
+  enum Status { OPTIMAL = 0, INFEASIBLE = 1, UNBOUNDED = 2, LIMIT = 3, FAILED = 4, CUTOFF = 5 };
+
+  // Loads the columns `cols` of p (all of them when empty). Column index k below is the position in `cols`.
+  LpSolver(const LpProblem& p, const std::vector<int>& cols, const LpOptions& opt);
+  ~LpSolver();
+  LpSolver(const LpSolver&) = delete;
+  LpSolver& operator=(const LpSolver&) = delete;
+
+  // Stops with CUTOFF as soon as the dual objective exceeds the cutoff (a proven lower bound of the LP value),
+  // with LIMIT after max_iter dual iterations (-1 = no limit). solve() uses the cutoff of set_cutoff().
+  Status solve();
+  Status solve(double cutoff, long max_iter = -1);
+  void set_cutoff(double cutoff);               // infinity switches it off
+  double cutoff() const;
+  void set_col_bounds(int k, double lb, double ub);
+  // Cutting planes: declared in P3, implemented in P4. Both throw std::logic_error until then.
+  void add_rows(const std::vector<int>& row_ptr, const std::vector<int>& col_idx, const std::vector<double>& val,
+                const std::vector<double>& row_lo, const std::vector<double>& row_up);
+  void remove_rows(int first_row);
+  void set_col_cost(int k, double cost);
+  std::vector<char> get_basis() const;          // one status per row, then per column
+  bool set_basis(const std::vector<char>& basis);
+  double obj() const;                           // objective of the last solve, offset included
+  void get_x(std::vector<double>& x) const;
+  void get_red_cost(std::vector<double>& d) const;
+  bool get_row_dual(std::vector<double>& y);    // refactorizes
+  int cols() const;
+  int rows() const;
+  long iterations() const;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
 
 }  // namespace scsp

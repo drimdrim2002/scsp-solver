@@ -24,6 +24,8 @@ add_library(scsp_core STATIC
   src/core/sc_solver.cpp
   src/core/lu.cpp
   src/core/lp.cpp
+  src/core/bnb.cpp
+  src/core/bin_solver.cpp
 )
 target_include_directories(scsp_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(scsp_core PUBLIC Threads::Threads)

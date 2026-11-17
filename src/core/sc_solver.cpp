@@ -12,6 +12,8 @@
 // relaxation; the greedy, the local search and the enumeration never exceed b.
 #include "scsp/sc_solver.hpp"
 
+#include "scsp/bnb.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -48,6 +50,12 @@ struct Shared {
   std::atomic<bool> stop{false}, proven{false};
   std::atomic<long long> sub_iters{0}, greedy_calls{0}, ls_moves{0}, enum_nodes{0}, passes{0};
   double last_lb_trace = -1.0;
+  // root LP published by the branch-and-bound thread (written once, then lp_ready is set)
+  std::vector<double> lp_u, lp_v, lp_rc;
+  double lp_bound = -INF;
+  std::atomic<bool> lp_ready{false}, infeasible{false};
+  BnbResult bnb;
+  bool bnb_ran = false;
 
   Shared(const Problem& p, const SolveOptions& o, Clock::time_point t) : P(p), opt(o), t0(t) {}
 
@@ -135,59 +143,65 @@ class Worker {
   }
 
   void run() {
-    init_multipliers();
-    double pi = pi_min();
-    double noise = 0.15 * id;
-    double seen_ub = INF;
-    double share = 0.5;  // part of the time given to the neighbourhood search
-    int enum_attempt = 0;
-    long long pass = 0, next_enum = 0;
-    while (!S.timeup()) {
-      const double t_pass = S.elapsed(), ub_pass = S.ub.load();
-      pass_cost = INF;
-      pass_best.clear();
-      three_phase();
-      if (explorer && !pass_best.empty() && (own.empty() || own_stall >= 60)) {
-        own = pass_best;  // restart the explorer from a fresh Lagrangian solution
-        own_cost = pass_cost;
-        own_stall = 0;
-        phi = 0.3;
-      }
-      ++S.passes;
-      if (S.timeup() || !have_root) break;
-      const bool cft_improved = S.ub.load() < ub_pass;
-      bool lns_improved = false;
-      if (S.opt.enumerate && S.ub.load() < INF) {
-        // a wide gap makes the bound-driven searches unproductive: leave the time to the Lagrangian passes
-        const double rel_gap = (S.ub.load() - lb_root) / std::max(std::fabs(S.ub.load()), 1e-12);
-        const bool wide = rel_gap > 0.05;
-        if (pass == 0) share = wide ? 0.15 : 0.5;
-        if (id == 0 && pass >= next_enum && (!wide || enum_attempt == 0)) {
-          enumerate(100000ULL << (2 * std::min(enum_attempt, 12)));
-          ++enum_attempt;
-          next_enum = 2 * pass + 1;
-        }
-        const double t0 = S.elapsed();
-        const double budget = std::max(0.02, share / (1.0 - share) * (t0 - t_pass));
-        while (!S.timeup() && S.elapsed() - t0 < budget) lns_improved |= lns_step();
-        if (S.timeup()) break;
-        if (lns_improved && !cft_improved) share = std::min(0.9, share + 0.1);
-        if (cft_improved && !lns_improved) share = std::max(0.1, share - 0.1);
-      }
-      ++pass;
-      const double ubn = S.ub.load();
-      if (ubn < seen_ub - 1e-12 * std::max(1.0, std::fabs(ubn))) {
-        pi = pi_min();
-      } else {
-        pi *= 1.1;
-        if (pi > 0.95) {
-          pi = pi_min();
-          noise = std::min(2.0, noise + 0.25);
-        }
-      }
-      seen_ub = ubn;
-      refine_fix(pi, noise);
+    begin();
+    while (!S.timeup() && pass()) {
     }
+  }
+
+  void begin() {
+    init_multipliers();
+    pi = pi_min();
+    noise = 0.15 * id;
+  }
+
+  // One round of the Lagrangian phases and the neighbourhood search. False when the worker cannot go on.
+  bool pass() {
+    if (S.timeup()) return false;
+    const double t_pass = S.elapsed(), ub_pass = S.ub.load();
+    pass_cost = INF;
+    pass_best.clear();
+    three_phase();
+    if (explorer && !pass_best.empty() && (own.empty() || own_stall >= 60)) {
+      own = pass_best;  // restart the explorer from a fresh Lagrangian solution
+      own_cost = pass_cost;
+      own_stall = 0;
+      phi = 0.3;
+    }
+    ++S.passes;
+    if (S.timeup() || !have_root) return false;
+    const bool cft_improved = S.ub.load() < ub_pass;
+    bool lns_improved = false;
+    if (S.opt.enumerate && S.ub.load() < INF) {
+      // a wide gap makes the bound-driven searches unproductive: leave the time to the Lagrangian passes
+      const double rel_gap = (S.ub.load() - lb_root) / std::max(std::fabs(S.ub.load()), 1e-12);
+      const bool wide = rel_gap > 0.05;
+      if (pass_no == 0) share = wide ? 0.15 : 0.5;
+      if (id == 0 && pass_no >= next_enum && (!wide || enum_attempt == 0)) {
+        enumerate(100000ULL << (2 * std::min(enum_attempt, 12)));
+        ++enum_attempt;
+        next_enum = 2 * pass_no + 1;
+      }
+      const double t0 = S.elapsed();
+      const double budget = std::max(0.02, share / (1.0 - share) * (t0 - t_pass));
+      while (!S.timeup() && S.elapsed() - t0 < budget) lns_improved |= lns_step();
+      if (S.timeup()) return false;
+      if (lns_improved && !cft_improved) share = std::min(0.9, share + 0.1);
+      if (cft_improved && !lns_improved) share = std::max(0.1, share - 0.1);
+    }
+    ++pass_no;
+    const double ubn = S.ub.load();
+    if (ubn < seen_ub - 1e-12 * std::max(1.0, std::fabs(ubn))) {
+      pi = pi_min();
+    } else {
+      pi *= 1.1;
+      if (pi > 0.95) {
+        pi = pi_min();
+        noise = std::min(2.0, noise + 0.25);
+      }
+    }
+    seen_ub = ubn;
+    refine_fix(pi, noise);
+    return true;
   }
 
  private:
@@ -210,7 +224,12 @@ class Worker {
 
   std::vector<double> u_root, v_root, rc_root;
   double lb_root = -INF;
-  bool have_root = false;
+  bool have_root = false, lp_adopted = false;
+  // state of run() between passes
+  double pi = 0.3, noise = 0.0, seen_ub = INF;
+  double share = 0.5;  // part of the time given to the neighbourhood search
+  int enum_attempt = 0;
+  long long pass_no = 0, next_enum = 0;
   std::vector<int> ls_cand;
 
   std::vector<double> sub, ssub, gam, capl;
@@ -766,7 +785,8 @@ class Worker {
     bool changed = false;
     if (thr < INF)
       for (int j = 0; j < n; ++j)
-        if (!dead[j] && rc_root[j] > 0 && lb_root + rc_root[j] > thr) {
+        if (!dead[j] && ((rc_root[j] > 0 && lb_root + rc_root[j] > thr) ||
+                         (lp_adopted && S.lp_rc[j] > 0 && S.lp_bound + S.lp_rc[j] > thr))) {
           dead[j] = 1;
           changed = true;
         }
@@ -784,6 +804,13 @@ class Worker {
   // fraction pi of the rows is covered, then restart from the root multipliers.
   void refine_fix(double pi, double noise) {
     unfix_all();
+    if (!lp_adopted && S.lp_ready.load(std::memory_order_acquire)) {
+      // The root LP only tightens reduced-cost fixing here. Its duals are a vertex of the dual
+      // polyhedron (many zeros) and make worse greedy solutions than the subgradient multipliers.
+      lp_adopted = true;
+      ls_cand.clear();
+      apply_rc_fix();
+    }
     u = u_root;
     v = v_root;
     for (int i = 0; i < m; ++i) u[i] *= 0.9 + 0.2 * rnd();  // different multipliers, different greedy solutions
@@ -1173,6 +1200,105 @@ class Worker {
 
 }  // namespace
 
+// Cover rows first, then the side rows.
+LpProblem to_lp(const Problem& P) {
+  LpProblem L;
+  L.n = P.n;
+  L.m = P.m + P.ns;
+  L.cost = P.cost;
+  L.lb.assign(P.n, 0.0);
+  L.ub.assign(P.n, 1.0);
+  L.rlo.assign(L.m, -INF);
+  L.rup.assign(L.m, INF);
+  for (int i = 0; i < P.m; ++i) L.rlo[i] = 1.0;
+  for (int t = 0; t < P.ns; ++t) L.rup[P.m + t] = P.side_rhs[t];
+  L.cptr.assign(1, 0);
+  for (int j = 0; j < P.n; ++j) {
+    for (int q = P.col_ptr[j]; q < P.col_ptr[j + 1]; ++q) {
+      L.cidx.push_back(P.col_row[q]);
+      L.cval.push_back(1.0);
+    }
+    for (int q = P.cs_ptr[j]; q < P.cs_ptr[j + 1]; ++q) {
+      L.cidx.push_back(P.m + P.cs_row[q]);
+      L.cval.push_back(P.cs_val[q]);
+    }
+    L.cptr.push_back(static_cast<int>(L.cidx.size()));
+  }
+  return L;
+}
+
+// One thread shared by a heuristic worker and the LP-based branch and bound: root LP first
+// (published to all workers), then the tree search hands the thread to the worker at node
+// boundaries so that each side gets its share of the time.
+void run_hybrid(Shared& S, int id, bool with_worker) {
+  const Problem& P = S.P;
+  Worker wk(S, id);
+  bool alive = false;
+  if (with_worker) {
+    wk.begin();
+    alive = wk.pass();  // a first solution before the root LP
+  }
+  const LpProblem L = to_lp(P);
+  // tree_share: part of this thread given to the tree. It grows while the worker's passes bring
+  // no better solution and shrinks again when they do.
+  double tree_share = 0.5, share_min = 0.5, share_max = 0.9;
+  double tree_time = 0.0, work_time = 0.0, last = S.elapsed();
+  BnbHooks H;
+  H.thr = [&S]() { return S.thr(); };
+  H.offer = [&S](const std::vector<int>& sol, double cost) { S.offer(sol, cost); };
+  H.offer_lb = [&S](double l) { S.offer_lb(l); };
+  H.stop = [&S]() { return S.timeup(); };
+  H.root = [&](const std::vector<double>& y, const std::vector<double>& d, double z) {
+    S.lp_u.resize(P.m);
+    S.lp_v.resize(P.ns);
+    for (int i = 0; i < P.m; ++i) S.lp_u[i] = std::max(y[i], 0.0);
+    for (int t = 0; t < P.ns; ++t) S.lp_v[t] = std::max(-y[P.m + t], 0.0);
+    S.lp_rc = d;
+    S.lp_bound = z;
+    S.lp_ready.store(true, std::memory_order_release);
+    // a wide root gap makes a finished tree unlikely: leave most of the thread to the heuristic
+    const double ub = S.ub.load();
+    if (ub < INF && (ub - z) / std::max(std::fabs(ub), 1e-12) > 0.05) tree_share = share_min = 0.15, share_max = 0.3;
+    last = S.elapsed();
+  };
+  H.yield = [&]() {
+    double now = S.elapsed();
+    tree_time += now - last;
+    // the worker runs whole passes, so it is charged for what it used before it may run again
+    while (alive && !S.timeup() && work_time < tree_time * (1.0 - tree_share) / tree_share) {
+      const double ub0 = S.ub.load();
+      alive = wk.pass();
+      const double t = S.elapsed();
+      work_time += t - now;
+      now = t;
+      if (S.ub.load() < ub0) tree_share = std::max(share_min, tree_share - 0.1);
+      else tree_share = std::min(share_max, tree_share + 0.05);
+    }
+    last = S.elapsed();
+  };
+  BnbOptions o;
+  o.seed = static_cast<unsigned>(S.opt.seed);
+  o.integral = P.integral;
+  o.time_limit = std::max(0.0, S.opt.time_limit - S.elapsed());
+  o.ryan_foster = false;
+  if (!S.timeup()) {
+    S.bnb = branch_and_bound(L, H, o);
+    S.bnb_ran = true;
+    if (S.bnb.status == BnbResult::EXHAUSTED) {
+      if (S.ub.load() < INF) {
+        S.set_optimal();
+      } else {
+        S.infeasible = true;
+        S.stop = true;
+      }
+    } else if (S.bnb.status == BnbResult::LP_INFEASIBLE) {
+      S.infeasible = true;
+      S.stop = true;
+    }
+  }
+  while (alive && !S.timeup()) alive = wk.pass();  // the tree gave up early: the worker takes the rest
+}
+
 SolveResult solve_sc(const Problem& orig, const SolveOptions& opt, const std::vector<int>* warm) {
   const auto t0 = Clock::now();
   SolveResult res;
@@ -1243,13 +1369,32 @@ SolveResult solve_sc(const Problem& orig, const SolveOptions& opt, const std::ve
     S.set_optimal();
   } else {
     const int nt = std::max(1, opt.threads);
+    // With three or more threads one of them does nothing but the root LP and the tree search and the
+    // others are heuristic workers. With fewer, the last thread shares its time between a worker and the tree.
+    const bool own_thread = opt.bnb && nt >= 3;
+    // Which worker gives up its thread was measured on the 2000-column DMS instances: keeping both
+    // "explorer" workers (odd ids) loses the least solution quality (docs/p3_report.md).
+    const int dropped = !own_thread ? -1 : (nt >= 4 ? 2 : nt - 1);
+    std::vector<int> ids;
+    for (int w = 0; w < nt; ++w)
+      if (w != dropped) ids.push_back(w);
+    const int hybrid = opt.bnb && !own_thread ? nt - 1 : -1;
     std::vector<std::thread> pool;
-    for (int w = 1; w < nt; ++w)
-      pool.emplace_back([&S, w]() {
-        Worker wk(S, w);
-        wk.run();
+    for (size_t k = 1; k < ids.size(); ++k) {
+      const int w = ids[k];
+      pool.emplace_back([&S, w, hybrid]() {
+        if (w == hybrid) {
+          run_hybrid(S, w, true);
+        } else {
+          Worker wk(S, w);
+          wk.run();
+        }
       });
-    {
+    }
+    if (own_thread) pool.emplace_back([&S, nt]() { run_hybrid(S, nt - 1, false); });
+    if (hybrid == 0) {
+      run_hybrid(S, 0, true);
+    } else {
       Worker wk(S, 0);
       wk.run();
     }
@@ -1281,6 +1426,21 @@ SolveResult solve_sc(const Problem& orig, const SolveOptions& opt, const std::ve
   res.ls_moves = S.ls_moves;
   res.enum_nodes = S.enum_nodes;
   res.passes = S.passes;
+  res.lp_root = NaN;
+  if (S.bnb_ran) {
+    static const char* names[] = {"exhausted", "stopped", "failed", "lp_infeasible"};
+    res.bnb_status = names[S.bnb.status];
+    if (S.lp_ready.load()) res.lp_root = S.lp_bound + P.offset;
+    res.lp_root_time = S.bnb.root_time;
+    res.bnb_nodes = S.bnb.nodes;
+    res.bnb_lp_iters = S.bnb.lp_iters;
+    res.bnb_strong = S.bnb.strong_lps;
+    res.bnb_cols = S.bnb.lp_cols;
+  }
+  if (S.infeasible.load() && !have) {
+    res.status = "infeasible";
+    return res;
+  }
   if (!have) {
     res.status = "no_solution";
     res.bound = S.shown_bound(lb, INF);

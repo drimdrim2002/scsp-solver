@@ -6,6 +6,7 @@
 #include <memory>
 #include <numeric>
 #include <random>
+#include <stdexcept>
 
 #include "scsp/lu.hpp"
 
@@ -27,7 +28,9 @@ struct Timer {
 class Simplex {
  public:
   enum : char { BASIC = 0, LOWER = 1, UPPER = 2, FREE = 3 };
-  enum { OPTIMAL = 0, INFEASIBLE = 1, UNBOUNDED = 2, LIMIT = 3, FAILED = 4 };
+  enum { OPTIMAL = 0, INFEASIBLE = 1, UNBOUNDED = 2, LIMIT = 3, FAILED = 4, CUTOFF = 5 };
+  double cutoff = INF;  // dual(): stop once the dual objective (scaled costs) exceeds this
+  long iter_cap = -1;   // dual(): iterations allowed in one call (-1 = no cap)
 
   int m = 0, nc = 0;
   std::vector<double> c, c0, lo, up, x, d, y;
@@ -75,6 +78,7 @@ class Simplex {
     d.push_back(0.0);
     bpos.push_back(-1);
     ++nc;
+    factored = false;  // the new column has no reduced cost yet
   }
 
   // Call after adding columns and before solving.
@@ -99,25 +103,88 @@ class Simplex {
   void set_cost(int v, double cost) { c[v] = c0[v] = cost; }
 
   // Dual simplex with perturbed costs, then the primal simplex with the true costs.
-  int solve() {
-    if (!refactor()) return FAILED;
-    compute_dual();
+  int solve(bool pert = true) {
+    if (!factored || pert || lu.updates() > opt.refactor / 2) {
+      if (!refactor()) return FAILED;
+      compute_dual();
+    }
     fix_dual();
-    if (opt.perturb) perturb();
-    const int s = dual();
-    c = c0;
-    if (s != OPTIMAL) return s;
-    return primal();
+    if (pert && opt.perturb) perturb();
+    int s = dual();
+    if (cost_mod) {  // perturbed or shifted costs: back to the true ones, the primal simplex cleans up
+      c = c0;
+      cost_mod = false;
+      factored = false;
+      if (s == OPTIMAL) s = primal();
+    }
+    return s;
+  }
+
+  // ---- incremental use (branch and bound) ----
+  void set_bounds(int v, double l, double u) {
+    lo[v] = l;
+    up[v] = u;
+    if (st[v] == BASIC) return;
+    if (l == u || st[v] == LOWER) {
+      if (l > -INF) st[v] = LOWER, x[v] = l;
+      else if (u < INF) st[v] = UPPER, x[v] = u;
+      else st[v] = FREE, x[v] = 0.0;
+    } else if (st[v] == UPPER) {
+      if (u < INF) x[v] = u;
+      else if (l > -INF) st[v] = LOWER, x[v] = l;
+      else st[v] = FREE, x[v] = 0.0;
+    }
+  }
+
+  void change_cost(int v, double cost) {
+    c[v] = c0[v] = cost;
+    factored = false;  // the reduced costs have to be recomputed
+  }
+
+  const std::vector<char>& basis() const { return st; }
+
+  bool set_basis(const std::vector<char>& b) {
+    if (static_cast<int>(b.size()) != m + nc) return false;
+    int k = 0;
+    for (int v = 0; v < m + nc; ++v)
+      if (b[v] == BASIC) ++k;
+    if (k != m) return false;
+    st = b;
+    k = 0;
+    for (int v = 0; v < m + nc; ++v) {
+      if (st[v] == BASIC) {
+        head[k] = v;
+        bpos[v] = k++;
+      } else {
+        bpos[v] = -1;
+        if (st[v] == LOWER && lo[v] > -INF) x[v] = lo[v];
+        else if (st[v] == UPPER && up[v] < INF) x[v] = up[v];
+        else set_nonbasic(v);
+      }
+    }
+    std::fill(dse.begin(), dse.end(), 1.0);
+    factored = false;
+    return true;
+  }
+
+  double objective() const {
+    double s = 0.0;
+    for (int v = m; v < m + nc; ++v) s += c0[v] * x[v];
+    return s;
   }
 
   // Dual simplex from the current basis (made dual feasible by bound flips and cost shifts).
   int dual() {
-    if (!refactor()) return FAILED;
-    compute_dual();
+    if (!factored || lu.updates() > opt.refactor / 2) {
+      if (!refactor()) return FAILED;
+      compute_dual();
+    }
     fix_dual();
     compute_primal();
     bool need = false;
     int trouble = 0;
+    const long it_start = it_dual;
+    bool stall_pert = false;
     auto cmp = [](const Cand& a, const Cand& b) { return a.theta > b.theta; };
     for (;;) {
       if (lu.updates() >= opt.refactor || need) {
@@ -129,6 +196,16 @@ class Simplex {
       }
       if ((it_dual & 31) == 0 && timer.sec() > opt.time_limit) return LIMIT;
       if (it_dual + it_primal >= opt.max_iter) return LIMIT;
+      if (iter_cap >= 0 && it_dual - it_start >= iter_cap) return LIMIT;
+      if (cutoff < INF && !cost_mod && (it_dual & 7) == 7) {
+        double ob = 0.0;
+        for (int v = m; v < m + nc; ++v) ob += c[v] * x[v];
+        if (ob > cutoff) return CUTOFF;
+      }
+      if (!stall_pert && opt.perturb && it_dual - it_start > 2L * m + 200) {  // degenerate stalling: perturb the costs now
+        perturb();
+        stall_pert = true;
+      }
 
       // pricing: dual steepest edge
       int r = -1;
@@ -285,7 +362,11 @@ class Simplex {
       if (primal_feasible()) return OPTIMAL;
       s = dual();
       c = c0;
-      if (s != OPTIMAL) return s;
+      cost_mod = false;
+      if (s != OPTIMAL) {
+        factored = false;
+        return s;
+      }
       compute_dual();
       if (dual_feasible()) return OPTIMAL;
     }
@@ -491,6 +572,8 @@ class Simplex {
   std::vector<Cand> cands;
   std::vector<std::pair<int, int>> bad;
   const double minus_one = -1.0;
+  bool factored = false;  // the LU factors belong to the current basis and d is current
+  bool cost_mod = false;  // c differs from c0 (perturbation or shifting)
 
   BasisLU::Col column(int v) const {
     if (v < m) return {&lidx[v], &minus_one, 1};
@@ -515,7 +598,10 @@ class Simplex {
     for (int attempt = 0; attempt < 4; ++attempt) {
       const int nbad = lu.factor(m, [this](int p) { return column(head[p]); }, &bad);
       ++n_refactor;
-      if (nbad == 0) return true;
+      if (nbad == 0) {
+        factored = true;
+        return true;
+      }
       for (const auto& pr : bad) {  // replace dependent columns by logicals
         set_nonbasic(head[pr.first]);
         head[pr.first] = pr.second;
@@ -567,12 +653,12 @@ class Simplex {
       const double dv = d[v];
       if (s == LOWER && dv < -opt.opt_tol) {
         if (up[v] < INF) st[v] = UPPER, x[v] = up[v];
-        else c[v] -= dv, d[v] = 0.0;
+        else c[v] -= dv, d[v] = 0.0, cost_mod = true;
       } else if (s == UPPER && dv > opt.opt_tol) {
         if (lo[v] > -INF) st[v] = LOWER, x[v] = lo[v];
-        else c[v] -= dv, d[v] = 0.0;
+        else c[v] -= dv, d[v] = 0.0, cost_mod = true;
       } else if (s == FREE && std::fabs(dv) > opt.opt_tol) {
-        c[v] -= dv, d[v] = 0.0;
+        c[v] -= dv, d[v] = 0.0, cost_mod = true;
       }
     }
   }
@@ -586,9 +672,10 @@ class Simplex {
       const int v = m + j;
       if (st[v] == BASIC || lo[v] == up[v]) continue;
       const double eps = 1e-6 * (std::fabs(c0[v]) + avg) * u(rng);
-      if (st[v] == LOWER) c[v] += eps;
-      else if (st[v] == UPPER) c[v] -= eps;
+      if (st[v] == LOWER) c[v] += eps, d[v] += eps;
+      else if (st[v] == UPPER) c[v] -= eps, d[v] -= eps;
     }
+    cost_mod = true;
   }
 
   // Row r of the tableau for the nonbasic variables: arow[v] = rho' a_v.
@@ -695,6 +782,78 @@ LpProblem LpProblem::from_csr(int n, int m, const double* cost, const double* lb
   return p;
 }
 
+// ------------------------------------------------------------------ LpSolver
+struct LpSolver::Impl {
+  Timer timer;
+  LpOptions opt;
+  double cs = 1.0, offset = 0.0;
+  int m = 0;
+  bool first = true;
+  double cutoff = INF;
+  Simplex S;
+  Impl(const LpProblem& P, const std::vector<int>& cols, const LpOptions& o)
+      : opt(o), offset(P.offset), m(P.m), S(P.m, P.rlo.data(), P.rup.data(), opt, timer) {
+    double cmax = 0.0;
+    for (double cj : P.cost) cmax = std::max(cmax, std::fabs(cj));
+    cs = cmax > 0.0 ? cmax : 1.0;
+    auto add = [&](int j) {
+      S.add_column(P.cidx.data() + P.cptr[j], P.cval.data() + P.cptr[j], P.cptr[j + 1] - P.cptr[j], P.cost[j] / cs,
+                   P.lb[j], P.ub[j]);
+    };
+    if (cols.empty())
+      for (int j = 0; j < P.n; ++j) add(j);
+    else
+      for (int j : cols) add(j);
+    S.finalize();
+  }
+};
+
+LpSolver::LpSolver(const LpProblem& p, const std::vector<int>& cols, const LpOptions& opt)
+    : impl_(new Impl(p, cols, opt)) {}
+LpSolver::~LpSolver() = default;
+
+LpSolver::Status LpSolver::solve() { return solve(impl_->cutoff, -1); }
+void LpSolver::set_cutoff(double cutoff) { impl_->cutoff = cutoff; }
+double LpSolver::cutoff() const { return impl_->cutoff; }
+void LpSolver::add_rows(const std::vector<int>&, const std::vector<int>&, const std::vector<double>&,
+                        const std::vector<double>&, const std::vector<double>&) {
+  throw std::logic_error("LpSolver::add_rows is implemented in P4 (cutting planes)");
+}
+void LpSolver::remove_rows(int) { throw std::logic_error("LpSolver::remove_rows is implemented in P4 (cutting planes)"); }
+
+LpSolver::Status LpSolver::solve(double cutoff, long max_iter) {
+  Impl& I = *impl_;
+  I.S.cutoff = cutoff < INF ? (cutoff - I.offset) / I.cs : INF;
+  I.S.iter_cap = max_iter;
+  const int s = I.S.solve(I.first);
+  I.first = false;
+  return static_cast<Status>(s);
+}
+void LpSolver::set_col_bounds(int k, double lb, double ub) { impl_->S.set_bounds(impl_->m + k, lb, ub); }
+void LpSolver::set_col_cost(int k, double cost) { impl_->S.change_cost(impl_->m + k, cost / impl_->cs); }
+std::vector<char> LpSolver::get_basis() const { return impl_->S.basis(); }
+bool LpSolver::set_basis(const std::vector<char>& b) { return impl_->S.set_basis(b); }
+double LpSolver::obj() const { return impl_->S.objective() * impl_->cs + impl_->offset; }
+int LpSolver::cols() const { return impl_->S.nc; }
+int LpSolver::rows() const { return impl_->m; }
+long LpSolver::iterations() const { return impl_->S.it_dual + impl_->S.it_primal; }
+void LpSolver::get_x(std::vector<double>& x) const {
+  const Impl& I = *impl_;
+  x.assign(I.S.x.begin() + I.m, I.S.x.end());
+}
+void LpSolver::get_red_cost(std::vector<double>& d) const {
+  const Impl& I = *impl_;
+  d.resize(I.S.nc);
+  for (int k = 0; k < I.S.nc; ++k) d[k] = I.S.d[I.m + k] * I.cs;
+}
+bool LpSolver::get_row_dual(std::vector<double>& y) {
+  Impl& I = *impl_;
+  if (!I.S.refresh()) return false;
+  y.resize(I.m);
+  for (int i = 0; i < I.m; ++i) y[i] = I.S.y[i] * I.cs;
+  return true;
+}
+
 LpResult solve_lp(const LpProblem& P, const LpOptions& opt) {
   Timer timer;
   LpResult R;
@@ -735,7 +894,7 @@ LpResult solve_lp(const LpProblem& P, const LpOptions& opt) {
       wcol.push_back(j);
     }
     S->finalize();
-    return S->solve();
+    return S->solve(true);
   };
 
   if (!sift) {
@@ -785,14 +944,14 @@ LpResult solve_lp(const LpProblem& P, const LpOptions& opt) {
     S->finalize();
     const int cap = opt.sift_cap > 0 ? opt.sift_cap : std::max(2 * m, 500);
     std::vector<std::pair<double, int>> neg;
-    status = S->solve();
+    status = S->solve(true);
     for (;;) {
       ++R.sift_rounds;
       if (status == Simplex::UNBOUNDED && !art.empty() && big <= 1e9) {
         // an artificial column that is too cheap can open a ray that the real problem does not have
         big *= 100.0;
         for (int v : art) S->set_cost(v, big);
-        status = S->solve();
+        status = S->solve(true);
         continue;
       }
       if (status != Simplex::OPTIMAL) break;
@@ -814,7 +973,7 @@ LpResult solve_lp(const LpProblem& P, const LpOptions& opt) {
         }
         big *= 100.0;  // the penalty was too small: the artificials still carry value
         for (int v : art) S->set_cost(v, big);
-        status = S->solve();
+        status = S->solve(true);
         continue;
       }
       if (static_cast<int>(neg.size()) > cap) {
@@ -829,7 +988,7 @@ LpResult solve_lp(const LpProblem& P, const LpOptions& opt) {
       S->finalize();
       // The new columns have negative reduced cost. Boxed ones move to their upper bound, which keeps
       // the basis dual feasible, and the dual simplex (bound flipping) repairs primal feasibility.
-      status = S->solve();
+      status = S->solve(true);
     }
     if (status == Simplex::INFEASIBLE || status == Simplex::UNBOUNDED) {
       // The artificial columns blur these two answers (an infeasible problem with a cost ray looks
