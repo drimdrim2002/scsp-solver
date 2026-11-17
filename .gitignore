@@ -1,0 +1,21 @@
+# build outputs
+build/
+build-*/
+dist/
+_skbuild/
+*.egg-info/
+__pycache__/
+*.py[cod]
+*.so
+*.dylib
+*.o
+*.a
+.pytest_cache/
+.DS_Store
+
+# downloaded / generated benchmark instances (see scripts/download_instances.sh)
+benchmarks/instances/
+*.part
+
+# raw solver logs (traces and summaries are tracked, logs are not)
+benchmarks/results/**/*.log

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "scsp"
+version = "0.0.1"
+description = "Set covering / set partitioning MIP solver (clean-room, C++17 core + pybind11)"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.22"]
+
+[project.optional-dependencies]
+# reference solvers are used as black boxes only (docs/design.md section 2)
+bench = ["scipy", "highspy>=1.16", "gurobipy"]
+test = ["pytest", "scipy"]
+
+[tool.scikit-build]
+minimum-version = "0.10"
+cmake.version = ">=3.18"
+cmake.build-type = "Release"
+wheel.packages = ["python/scsp"]
+sdist.include = ["include", "src", "python", "CMakeLists.txt"]
+sdist.exclude = ["benchmarks", "docs", "docker", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

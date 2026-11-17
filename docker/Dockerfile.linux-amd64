@@ -1,0 +1,27 @@
+# Linux x86-64 build check (g++). Build with:  scripts/linux_build.sh
+FROM python:3.12-slim-bookworm
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends g++ make \
+ && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir "scikit-build-core>=0.10" "pybind11>=2.12" cmake ninja numpy scipy pytest
+
+WORKDIR /src
+COPY CMakeLists.txt pyproject.toml ./
+COPY include ./include
+COPY src ./src
+COPY python ./python
+COPY tests ./tests
+
+# 1) native library + C++ smoke test, warnings as errors
+RUN cmake -S . -B /tmp/build-native -G Ninja -DSCSP_BUILD_PYTHON=OFF -DSCSP_BUILD_TESTS=ON -DSCSP_WERROR=ON \
+ && cmake --build /tmp/build-native \
+ && ctest --test-dir /tmp/build-native --output-on-failure
+
+# 2) Python wheel through scikit-build-core, installed and imported outside the source tree
+RUN pip wheel . --no-build-isolation --no-deps -w /tmp/wheels \
+ && pip install --no-cache-dir /tmp/wheels/scsp-*.whl \
+ && cd /tmp && python -c "import scsp; print(scsp.__file__); print(scsp.version(), '|', scsp.build_info(), '|', scsp.hardware_threads(), scsp.parallel_sum(10**6, 4))" \
+ && cd /src && python -m pytest -q tests
+
+CMD ["python", "-c", "import scsp; print(scsp.version(), '|', scsp.build_info())"]

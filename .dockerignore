@@ -1,0 +1,8 @@
+.git
+build
+dist
+_skbuild
+benchmarks
+docs
+**/__pycache__
+**/*.so

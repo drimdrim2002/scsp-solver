@@ -1,0 +1,26 @@
+name,generator,params,kind,rows,cols,nnz,side_rows,side_rhs,warm_start_cols,warm_start_obj,sha256_16
+dms_K50_n500_s1,dms,n_orders=50;n_bundles=500;tight=False;seed=1,SC+side,50,500,1098,3,15 10 50,25,5002.010000,d8a5a8fa621dd8bd
+dms_K50_n2000_s1,dms,n_orders=50;n_bundles=2000;tight=False;seed=1,SC+side,50,2000,5005,3,15 10 50,22,4781.668000,630f417f8f7b257b
+dms_K100_n1000_s1,dms,n_orders=100;n_bundles=1000;tight=False;seed=1,SC+side,100,1000,2254,3,30 20 100,42,4478.613000,2eeaa80929e8396c
+dms_K100_n2000_s1,dms,n_orders=100;n_bundles=2000;tight=False;seed=1,SC+side,100,2000,4634,3,30 20 100,46,4756.954000,a7feb00a070dadbf
+dms_K100_n2000_tight_s1,dms,n_orders=100;n_bundles=2000;tight=True;seed=1,SC+side,100,2000,4648,3,5 8 34,43,4556.512000,f281fd8d0b513555
+dms_K100_n2000_s2,dms,n_orders=100;n_bundles=2000;tight=False;seed=2,SC+side,100,2000,4738,3,30 20 100,43,4346.256000,86d53aeabcdd8c09
+dms_K200_n2000_s1,dms,n_orders=200;n_bundles=2000;tight=False;seed=1,SC+side,200,2000,4388,3,60 40 200,91,4736.063500,23e1c5f5946f2223
+dms_K200_n2000_tight_s1,dms,n_orders=200;n_bundles=2000;tight=True;seed=1,SC+side,200,2000,4589,3,7 26 52,79,4345.632500,72464821eb372f09
+dms_K300_n2000_s1,dms,n_orders=300;n_bundles=2000;tight=False;seed=1,SC+side,300,2000,4373,3,90 60 300,127,4549.149667,92e26b3aeb1966c6
+dms_K500_n2000_s1,dms,n_orders=500;n_bundles=2000;tight=False;seed=1,SC+side,500,2000,4270,3,150 100 500,222,4628.039200,be4fe6a2473ae940
+dms_K100_n5000_s1,dms,n_orders=100;n_bundles=5000;tight=False;seed=1,SC+side,100,5000,12873,3,30 20 100,47,4798.000000,d2d38c72ea39cbf9
+dms_K200_n10000_s1,dms,n_orders=200;n_bundles=10000;tight=False;seed=1,SC+side,200,10000,26020,3,60 40 200,86,4531.448000,f3c91d9de1fc1db1
+dms_K300_n20000_s1,dms,n_orders=300;n_bundles=20000;tight=False;seed=1,SC+side,300,20000,53672,3,90 60 300,129,4492.075333,49384a169ffdb1f1
+dms_K500_n30000_s1,dms,n_orders=500;n_bundles=30000;tight=False;seed=1,SC+side,500,30000,79672,3,150 100 500,215,4524.922200,b4ad5ceb6573823a
+dms_K500_n30000_tight_s1,dms,n_orders=500;n_bundles=30000;tight=True;seed=1,SC+side,500,30000,80103,3,23 68 139,217,4504.920000,94fee90a45fc0e89
+dms_K1000_n60000_s1,dms,n_orders=1000;n_bundles=60000;tight=False;seed=1,SC+side,1000,60000,160103,3,300 200 1000,424,4542.657400,35b3cf9abca8bf07
+dms_K2000_n60000_s1,dms,n_orders=2000;n_bundles=60000;tight=False;seed=1,SC+side,2000,60000,147982,3,600 400 2000,885,4640.754650,19cb7bfd91ff2e04
+sp_m50_n500_s1,sp,n_rows=50;n_cols=500;seed=1,SP,50,500,2131,0,,16,16528.000000,521d0bd94f7bac1d
+sp_m100_n1000_s1,sp,n_rows=100;n_cols=1000;seed=1,SP,100,1000,4450,0,,29,32389.000000,f9c020947d184b74
+sp_m100_n2000_s1,sp,n_rows=100;n_cols=2000;seed=1,SP,100,2000,9168,0,,29,33013.000000,30430dcc7dcc3589
+sp_m200_n2000_s1,sp,n_rows=200;n_cols=2000;seed=1,SP,200,2000,8936,0,,54,64853.000000,5049b5b635edbfa1
+sp_m200_n2000_s2,sp,n_rows=200;n_cols=2000;seed=2,SP,200,2000,9093,0,,48,65518.000000,0533c21661d0bb7e
+sp_m300_n2000_s1,sp,n_rows=300;n_cols=2000;seed=1,SP,300,2000,9004,0,,75,96931.000000,3ce4eaeab0ae5f6f
+sp_m400_n2000_s1,sp,n_rows=400;n_cols=2000;seed=1,SP,400,2000,8906,0,,102,130137.000000,ba2559bc353bf3e6
+sp_m300_n10000_s1,sp,n_rows=300;n_cols=10000;seed=1,SP,300,10000,47426,0,,78,93797.000000,5d0167fe795b0994

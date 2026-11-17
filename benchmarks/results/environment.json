@@ -1,0 +1,32 @@
+{
+  "date": "2026-11-17",
+  "machine": {
+    "cpu": "Apple M4",
+    "logical_cpus": 10,
+    "performance_cores": "4",
+    "efficiency_cores": "6",
+    "memory_gb": 24,
+    "os": "macOS-27.0.1-arm64-arm-64bit"
+  },
+  "python": "3.12.13",
+  "packages": {
+    "numpy": "2.1.3",
+    "scipy": "1.15.2",
+    "highspy": "1.16.0",
+    "gurobipy": "13.0.2",
+    "scsp": "0.0.1",
+    "scsp_build": "clang 21.0.0 arm64 darwin c++201703"
+  },
+  "baseline_settings": {
+    "threads": 4,
+    "seeds": [
+      1,
+      2,
+      3
+    ],
+    "time_limit_s": 60,
+    "gurobi": "defaults + Threads, TimeLimit, Seed, MIPGap=0; size-limited licence (vars <= 2000 and constraints <= 2000)",
+    "highs": "defaults + threads, time_limit, random_seed, mip_rel_gap=0 (logging on but silent so that the logging callback fires)",
+    "execution": "one run at a time, each in its own process; trace time is wall-clock from the optimize call"
+  }
+}
