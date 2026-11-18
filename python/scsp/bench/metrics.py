@@ -107,6 +107,13 @@ def load_all_runs(root: Path | None = None) -> list:
     return runs
 
 
+def run_value(r: dict):
+    """Objective of the solution a run returned: recomputed from the solution when the record has
+    it (`obj_check`), so a solver that reports a wrong objective is charged what its solution costs."""
+    v = r.get("obj_check")
+    return r["obj"] if v is None else v
+
+
 def per_run_rows(runs: list, bks: dict, sets: dict, times=TIMES) -> list:
     """One row per (config, instance, seed, threads, warm_start)."""
     groups = defaultdict(list)
@@ -130,9 +137,11 @@ def per_run_rows(runs: list, bks: dict, sets: dict, times=TIMES) -> list:
             # a run that proved optimality before t is the same run under any limit >= its runtime
             proved = [r for r in rs if r["status"] == "optimal" and float(r["runtime"]) <= t]
             if exact:
-                obj, src = exact[0]["obj"], "run"
+                obj, src = run_value(exact[0]), "run"
             elif proved:
-                obj, src = proved[0]["obj"], "run"
+                obj, src = run_value(proved[0]), "run"
+            elif longer and longer[0].get("verified") is False:
+                obj, src = None, "unverified"            # the trace of such a run cannot be trusted either
             elif longer:
                 obj, src = obj_at(longer[0]["trace"], t), "trace"
             else:
@@ -141,10 +150,10 @@ def per_run_rows(runs: list, bks: dict, sets: dict, times=TIMES) -> list:
             row[f"obj_{tag}"] = obj
             row[f"gap_{tag}"] = gap_pct(obj, bks_val)
             row[f"src_{tag}"] = src
-        solved = [r for r in rs if r["status"] == "optimal"]
-        row["status"] = "optimal" if solved else longest["status"]
+        solved = [r for r in rs if r["status"] == "optimal" and r.get("verified") is not False]
+        row["status"] = "optimal" if solved else ("unverified" if longest["status"] == "optimal" else longest["status"])
         row["proof_time"] = min(float(r["runtime"]) for r in solved) if solved else None
-        row["final_obj"] = longest["obj"]
+        row["final_obj"] = run_value(longest)
         row["final_bound"] = longest["bound"]
         row["final_gap_pct"] = None if longest["gap"] is None else 100.0 * longest["gap"]
         horizon = float(longest["time_limit"])

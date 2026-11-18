@@ -57,7 +57,9 @@ class LpSolver(_core.LpSolver):
         basis = lp.get_basis(); lp.set_basis(basis)
         lp.set_cutoff(z)                          # solve() returns "cutoff" once the dual objective exceeds z
 
-    add_rows / remove_rows (cutting planes) raise NotImplementedError until P4.
+        lp.add_rows(row_ptr, col_idx, val, row_lo, row_up)   # cutting planes, row-wise over the columns;
+        lp.solve()                                # ... the dual simplex repairs the violated rows from the last basis
+        lp.row_status(), lp.row_activity          # 0 = not tight; lp.remove_rows([...]) keeps the basis for such rows
     """
 
     def __init__(self, model: Model, seed: int = 1, time_limit: float | None = None):

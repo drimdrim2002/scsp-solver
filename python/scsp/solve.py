@@ -59,7 +59,8 @@ def _warm_indices(model: Model, warm_start) -> np.ndarray | None:
 
 def solve(model: Model, time_limit: float = 10.0, threads: int = 4, seed: int = 1, warm_start=None,
           mip_gap: float = 0.0, trace: bool = True, presolve: bool = True, local_search: bool = True,
-          enumerate: bool = True, bnb: bool = True, verify: bool = True) -> Result:
+          enumerate: bool = True, bnb: bool = True, verify: bool = True, tree_giveup: float | None = None,
+          cuts: int | None = None) -> Result:
     """Solve a set covering / partitioning model. `warm_start` is a 0/1 vector or a list of
     column indices; the returned solution is never worse than a feasible warm start.
 
@@ -80,6 +81,8 @@ def solve(model: Model, time_limit: float = 10.0, threads: int = 4, seed: int = 
             offset=float(model.obj_offset), time_limit=float(time_limit), threads=int(threads), seed=int(seed),
             mip_gap=float(mip_gap), warm=warm.tolist() if warm_ok else None,
             presolve=presolve, local_search=local_search, enumerate=enumerate, bnb=bnb,
+            **({} if tree_giveup is None else {"tree_giveup": float(tree_giveup)}),
+            **({} if cuts is None else {"cuts": int(cuts)}),
         )
         path = "sc"
     else:
@@ -91,6 +94,7 @@ def solve(model: Model, time_limit: float = 10.0, threads: int = 4, seed: int = 
             np.ascontiguousarray(lower, dtype=np.float64), np.ascontiguousarray(upper, dtype=np.float64),
             offset=float(model.obj_offset), time_limit=float(time_limit), threads=int(threads), seed=int(seed),
             mip_gap=float(mip_gap), warm=warm.tolist() if warm_ok else None,
+            **({} if local_search else {"local_search": False}), **({} if cuts is None else {"cuts": int(cuts)}),
         )
         path = "bin"
     cols = np.asarray(r["cols"], dtype=np.int64)

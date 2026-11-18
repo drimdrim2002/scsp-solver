@@ -115,15 +115,11 @@ def test_cutoff_and_iteration_limit():
     assert fresh_lp.solve() == "optimal" and fresh_lp.obj == pytest.approx(z)
 
 
-def test_errors_and_p4_placeholders():
+def test_errors():
     model = generate_sp(20, 200, seed=1)
     lp = LpSolver(model)
     with pytest.raises(IndexError):
         lp.set_col_bounds(model.n_cols, 0.0, 1.0)
     with pytest.raises(ValueError):
         lp.set_col_bounds(0, 1.0, 0.0)
-    with pytest.raises(NotImplementedError):
-        lp.add_rows([0, 1], [0], [1.0], [1.0], [1.0])
-    with pytest.raises(NotImplementedError):
-        lp.remove_rows(0)
     assert scsp.LpSolver is LpSolver

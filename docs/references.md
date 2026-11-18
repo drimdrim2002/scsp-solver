@@ -88,8 +88,21 @@ BKS 대조에서 나온 사실:
 | exact cover 탐색(쓸 수 있는 열이 가장 적은 행부터, 선택한 열과 겹치는 열 금지, 한도를 늘리며 재시작) | `bnb.cpp` `cover_search` | 행 선택 규칙은 Knuth 2000 "Dancing links"의 Algorithm X(서지 미대조). 열 순서(루트 reduced cost)와 재시작은 자체 구성 |
 | LP 해 greedy 반올림(충족 안 된 행을 돕고 상한을 넘지 않는 열을 LP 값 순으로, 뒤에 중복 열 제거) | `bnb.cpp` `round_greedy` | 자체 구성 |
 | SC 풀이에서 스레드 하나가 루트 LP와 트리 탐색을 맡고, 루트 LP의 reduced cost를 휴리스틱 worker의 열 제거에 씀 | `src/core/sc_solver.cpp` `run_hybrid`, `apply_rc_fix` | 자체 구성(Beasley 1987의 reduced cost fixing을 LP 값으로 적용) |
+| 트리 스레드 반환: 루트 LP 시간 한도, 남은 시간에 풀 수 있는 노드 수 추정, 하한이 오르는 최근 속도로 남은 시간을 추정해 가망이 없으면 그 스레드를 휴리스틱 worker로 전환 | `sc_solver.cpp` `run_hybrid`(`H.keep`) | 자체 구성 |
+| 큐에서 꺼낸 노드를 부모의 최적 기저에서 시작, strong branching 뒤 기저와 dual steepest edge 가중치를 함께 복원 | `bnb.cpp` `node_basis`, `lp.cpp` `LpSolver::save_state` | 노드 LP warm start는 MIP 솔버의 일반적 방법. 가중치 복원은 Koberstein 2005의 가중치 정의(기저에만 의존)에서 나온 자체 구성 |
+| 노드별 reduced cost fixing(노드 LP 값 + reduced cost가 기준을 넘는 열을 그 가지에서 고정) | `bnb.cpp` `local_fix` | Beasley 1987의 reduced cost fixing을 노드 LP에 적용(MIP 솔버의 일반적 방법) |
+| strong branching 조기 중단(연속 8개 후보가 최고 점수를 못 넘으면 멈춤) | `bnb.cpp` `branch_var` | Achterberg, Koch & Martin 2005의 lookahead |
+| LP에 행 추가(새 행 변수를 기저에 넣어 dual simplex로 이어 풂)·느슨한 행 삭제 | `lp.cpp` `LpSolver::add_rows`, `remove_rows` | dual simplex의 표준 재최적화. simplex 객체를 다시 만들고 기저만 넘기는 구현은 자체 구성 |
+| zero-half 컷: 홀수 개의 행을 더해 2로 나누고 올림(덮기 쪽) 또는 내림(묶기 쪽 — odd hole 부등식이 여기에 속함). 분리는 greedy(행을 하나씩 더하며 "여유 합 + 홀수 번 덮는 열의 LP 값 합"이 1 미만인 홀수 집합을 찾음) | `src/core/cuts.cpp` `separate_zero_half` | Caprara & Fischetti 1996(정의와 위반 조건); odd hole은 Hoffman & Padberg 1993. greedy 분리는 자체 구성 |
+| clique 컷: 묶기 행을 공유하는 열들의 clique를 LP 값이 큰 열부터 greedy로 만들고 0인 열로 확장 | `cuts.cpp` `separate_cliques` | Hoffman & Padberg 1993 |
+| 루트 컷 라운드(효율 순 선택, 느슨한 컷 삭제, 컷 뒤의 LP 값과 reduced cost로 다시 열 고정, 밀도 한도, 효과 없으면 전부 제거) | `bnb.cpp` `root_cuts` | cut-and-branch의 일반적 구성. 한도 값들은 자체 구성 |
+| RINS: 노드 LP 해와 최고해가 일치하는 열을 고정하고 나머지를 작은 문제로 풂 | `bnb.cpp` `Search::rins`, `bin_solver.cpp` `lns_step` | Danna, Rothberg & Le Pape 2005 |
+| 고정 이웃 탐색: 최고해의 무작위 일부를 1로 고정하고, 나머지 최고해 열 + 루트 reduced cost가 작은 열만으로 부분 문제를 풂(크기 자동 조절). 일반 경로에서 남는 스레드가 맡음 | `bin_solver.cpp` `lns_step` | large neighbourhood search(Shaw 1998)의 일반적 틀. 이웃 정의와 조절 규칙은 자체 구성 |
+| 분할 문제 presolve: 중복 열, 분할 행의 포함 관계(큰 행의 나머지 열 = 0), 열이 하나 남은 행 고정 | `bin_solver.cpp` `presolve_bin` | Borndörfer 1998(학위논문 2장의 SPP 전처리) |
+| 제한 트리에서 해를 찾으면 바로 정확한 트리로 전환 | `bnb.cpp` `Search::run`(`SWITCH`) | 자체 구성 |
+| 시작해 생성(벤치마크용): 최선해 주변 destroy/repair("근처"), 빈 해에서 greedy + 하강("독립") | `python/scsp/bench/warm.py` | ALNS(Ropke & Pisinger 2006)의 destroy/repair를 흉내 낸 자체 구성 |
 
-솔버 기법을 구현할 때마다 이 표에 한 줄씩 추가한다(P3분까지 반영, 2026-11-18).
+솔버 기법을 구현할 때마다 이 표에 한 줄씩 추가한다(P4분까지 반영, 2026-11-19).
 
 P2에서 새로 인용한 문헌 두 건은 Crossref 대조를 하지 않았다(네트워크 조회를 하지 않고 기억한 서지로 적음 — 확인 필요).
 
@@ -100,3 +113,9 @@ P3에서 새로 인용한 문헌 두 건도 대조하지 않았다(네트워크 
 
 - Land, A.H., Doig, A.G. (1960). An automatic method of solving discrete programming problems. *Econometrica* 28(3), 497–520.
 - Knuth, D.E. (2000). Dancing links. In *Millennial Perspectives in Computer Science*, 187–214. (arXiv:cs/0011047)
+
+P4에서 새로 인용한 문헌 두 건도 대조하지 않았다(네트워크 조회 없음 — 확인 필요). P4의 나머지 출처(Caprara & Fischetti 1996,
+Hoffman & Padberg 1993, Danna et al. 2005, Borndörfer 1998, Achterberg, Koch & Martin 2005)는 1장에서 이미 대조한 것이다.
+
+- Shaw, P. (1998). Using constraint programming and local search methods to solve vehicle routing problems. In *CP-98*, LNCS 1520, 417–431.
+- Ropke, S., Pisinger, D. (2006). An adaptive large neighborhood search heuristic for the pickup and delivery problem with time windows. *Transportation Science* 40(4), 455–472.

@@ -24,6 +24,7 @@ add_library(scsp_core STATIC
   src/core/sc_solver.cpp
   src/core/lu.cpp
   src/core/lp.cpp
+  src/core/cuts.cpp
   src/core/bnb.cpp
   src/core/bin_solver.cpp
 )

@@ -38,6 +38,8 @@ using Clock = std::chrono::steady_clock;
 constexpr double INF = std::numeric_limits<double>::infinity();
 constexpr double NaN = std::numeric_limits<double>::quiet_NaN();
 static const bool DEBUG_SUB = std::getenv("SCSP_DEBUG_SUB") != nullptr;
+static const bool DEBUG_TREE = std::getenv("SCSP_DEBUG_TREE") != nullptr;
+static const bool NO_LP_ADOPT = std::getenv("SCSP_NO_LP_ADOPT") != nullptr;  // experiment: workers ignore the root LP
 
 struct Shared {
   const Problem& P;
@@ -56,6 +58,7 @@ struct Shared {
   std::atomic<bool> lp_ready{false}, infeasible{false};
   BnbResult bnb;
   bool bnb_ran = false;
+  double tree_gave_up = -1.0;  // time at which the tree thread became a heuristic worker (-1: it did not)
 
   Shared(const Problem& p, const SolveOptions& o, Clock::time_point t) : P(p), opt(o), t0(t) {}
 
@@ -804,7 +807,7 @@ class Worker {
   // fraction pi of the rows is covered, then restart from the root multipliers.
   void refine_fix(double pi, double noise) {
     unfix_all();
-    if (!lp_adopted && S.lp_ready.load(std::memory_order_acquire)) {
+    if (!lp_adopted && !NO_LP_ADOPT && S.lp_ready.load(std::memory_order_acquire)) {
       // The root LP only tightens reduced-cost fixing here. Its duals are a vertex of the dual
       // polyhedron (many zeros) and make worse greedy solutions than the subgradient multipliers.
       lp_adopted = true;
@@ -1230,9 +1233,13 @@ LpProblem to_lp(const Problem& P) {
 // One thread shared by a heuristic worker and the LP-based branch and bound: root LP first
 // (published to all workers), then the tree search hands the thread to the worker at node
 // boundaries so that each side gets its share of the time.
-void run_hybrid(Shared& S, int id, bool with_worker) {
+//
+// With a thread of its own (with_worker false) the tree is watched instead: when the root LP is too
+// expensive or the lower bound rises too slowly to reach the incumbent in the time that is left, the
+// tree is given up and the thread becomes the heuristic worker `reserve` for the rest of the run.
+void run_hybrid(Shared& S, int id, bool with_worker, int reserve = -1) {
   const Problem& P = S.P;
-  Worker wk(S, id);
+  Worker wk(S, with_worker || reserve < 0 ? id : reserve);
   bool alive = false;
   if (with_worker) {
     wk.begin();
@@ -1281,7 +1288,86 @@ void run_hybrid(Shared& S, int id, bool with_worker) {
   o.integral = P.integral;
   o.time_limit = std::max(0.0, S.opt.time_limit - S.elapsed());
   o.ryan_foster = false;
-  if (!S.timeup()) {
+  o.cuts = S.opt.cuts < 0 ? 1 : S.opt.cuts;
+  o.rins = S.opt.local_search;
+  H.incumbent = [&S](std::vector<int>& cols) {
+    std::lock_guard<std::mutex> g(S.mu);
+    cols = S.best;
+  };
+  // Watching the tree (only when the tree has a thread of its own and a worker waits to take it over).
+  //   0. Before anything: with fractional costs (no rounding of bounds, so a proof needs a real tree) and
+  //      a root LP estimated at more than 2% of the time limit (1.5e-8 s x rows x columns, fitted on the
+  //      benchmark set), neither the LP nor the tree is started.
+  //   1. Root LP: given up when it takes longer than 4% of the time limit (at least 0.3 s).
+  //   2. Size: a node costs about (root LP time) x (share of columns left after reduced cost fixing).
+  //      If the time left pays for fewer than 300 such nodes (1000 with fractional costs), the tree is
+  //      not started.
+  //   3. Progress: f = share of the root gap closed by the tree's bound (cut rounds included), read at
+  //      times c, 2c, 4c, ... With the gain d over the last interval, even at that rate (the bound of a
+  //      best-first search slows down, it does not speed up) the rest takes (1 - f) / d intervals. If
+  //      that is more than tree_giveup times the time left at two readings in a row, the tree is given up.
+  const bool watched = !with_worker && reserve >= 0 && S.opt.tree_giveup > 0.0;
+  double t_tree = -1.0, t_check = 0.0, t_last = 0.0, f_prev = 0.0, t_log = 0.0;
+  long n_last = 0;
+  int strikes = 0;
+  bool skip_tree = false;
+  if (watched) o.root_time_limit = std::max(0.3, 0.04 * S.opt.time_limit);
+  const double t_lp0 = S.elapsed();
+  if (watched || DEBUG_TREE) {
+    const auto root0 = H.root;
+    H.root = [&, root0](const std::vector<double>& y, const std::vector<double>& d, double z) {
+      root0(y, d, z);
+      const double now = S.elapsed(), t_lp = now - t_lp0, thr = S.thr();
+      if (thr == INF) return;
+      long left_cols = 0;
+      for (int j = 0; j < P.n; ++j) left_cols += z + std::max(d[j], 0.0) <= thr;
+      const double node = std::max(t_lp * static_cast<double>(left_cols) / std::max(1, P.n), 1e-6);
+      const double nodes = (S.opt.time_limit - now) / node;
+      skip_tree = watched && nodes < (P.integral ? 300.0 : 1000.0);
+      if (DEBUG_TREE)
+        std::fprintf(stderr, "tree root t_lp=%.3f cols %ld/%d est. nodes in the time left %.0f -> %s\n", t_lp, left_cols, P.n,
+                     nodes, skip_tree ? "no tree" : "tree");
+    };
+    H.keep = [&](double bound, long nodes) {
+      if (skip_tree) return false;
+      const double now = S.elapsed();
+      if (t_tree < 0.0) {
+        t_tree = now;
+        t_check = std::max(0.25, 0.01 * S.opt.time_limit);
+      }
+      const double t = now - t_tree, thr = S.thr(), z = S.lp_bound;
+      if (thr == INF) return true;
+      const double f = thr - z > 1e-12 ? std::min(1.0, std::max(0.0, (bound - z) / (thr - z))) : 1.0;
+      if (DEBUG_TREE && t >= t_log) {
+        std::fprintf(stderr, "tree t=%.3f nodes=%ld z=%.6g bound=%.6g thr=%.6g f=%.4f\n", t, nodes, z, bound, thr, f);
+        t_log = std::max(0.01, t * 1.25);
+      }
+      if (!watched || t < t_check) return true;
+      const double left = S.opt.time_limit - now;
+      if (nodes - n_last < 20) {  // too few nodes since the last reading to judge a rate
+        t_check = t * 1.25;
+        // ... unless the nodes are simply too slow: not even 20 of them in a quarter of the time limit
+        return !(nodes < 20 && t > std::max(1.0, 0.25 * S.opt.time_limit));
+      }
+      const double d = std::max(f - f_prev, 0.0);
+      const double rest = d > 1e-12 ? (1.0 - f) / d * (t - t_last) : INF;  // time for the rest at the last interval's rate
+      if (rest > 10.0 * S.opt.tree_giveup * left) strikes += 2;
+      else if (rest > S.opt.tree_giveup * left) ++strikes;
+      else strikes = 0;
+      if (DEBUG_TREE)
+        std::fprintf(stderr, "tree check t=%.3f nodes=%ld f=%.4f gain=%.4f rest=%.1f s left=%.1f s strikes=%d\n", t, nodes, f, d, rest, left,
+                     strikes);
+      f_prev = f;
+      t_last = t;
+      n_last = nodes;
+      t_check = t * 2.0;
+      return strikes < 2;
+    };
+  }
+  const double lp_estimate = 1.5e-8 * static_cast<double>(P.m + P.ns) * static_cast<double>(P.n);
+  const bool no_lp = watched && !P.integral && lp_estimate > 0.02 * S.opt.time_limit;
+  if (DEBUG_TREE && no_lp) std::fprintf(stderr, "tree: root LP estimated at %.2f s, not started\n", lp_estimate);
+  if (!S.timeup() && !no_lp) {
     S.bnb = branch_and_bound(L, H, o);
     S.bnb_ran = true;
     if (S.bnb.status == BnbResult::EXHAUSTED) {
@@ -1295,6 +1381,12 @@ void run_hybrid(Shared& S, int id, bool with_worker) {
       S.infeasible = true;
       S.stop = true;
     }
+  }
+  if (!with_worker && reserve >= 0 && !S.timeup()) {  // the tree was given up: this thread turns into a worker
+    if (DEBUG_TREE) std::fprintf(stderr, "tree thread becomes worker %d at %.3f s\n", reserve, S.elapsed());
+    S.tree_gave_up = S.elapsed();
+    wk.begin();
+    alive = true;
   }
   while (alive && !S.timeup()) alive = wk.pass();  // the tree gave up early: the worker takes the rest
 }
@@ -1391,7 +1483,7 @@ SolveResult solve_sc(const Problem& orig, const SolveOptions& opt, const std::ve
         }
       });
     }
-    if (own_thread) pool.emplace_back([&S, nt]() { run_hybrid(S, nt - 1, false); });
+    if (own_thread) pool.emplace_back([&S, nt, dropped]() { run_hybrid(S, nt - 1, false, dropped); });
     if (hybrid == 0) {
       run_hybrid(S, 0, true);
     } else {
@@ -1436,6 +1528,14 @@ SolveResult solve_sc(const Problem& orig, const SolveOptions& opt, const std::ve
     res.bnb_lp_iters = S.bnb.lp_iters;
     res.bnb_strong = S.bnb.strong_lps;
     res.bnb_cols = S.bnb.lp_cols;
+    res.tree_gave_up = S.tree_gave_up;
+    res.lp_root_cut = S.bnb.root_cut + P.offset;
+    res.cuts = S.bnb.cuts;
+    res.cut_rounds = S.bnb.cut_rounds;
+    res.cut_time = S.bnb.cut_time;
+    res.node_fixed = S.bnb.node_fixed;
+    res.rins_calls = S.bnb.rins_calls;
+    res.rins_found = S.bnb.rins_found;
   }
   if (S.infeasible.load() && !have) {
     res.status = "infeasible";

@@ -67,6 +67,14 @@ py::dict result_dict(const scsp::SolveResult& r) {
   st["bnb_lp_iters"] = r.bnb_lp_iters;
   st["bnb_strong"] = r.bnb_strong;
   st["bnb_cols"] = r.bnb_cols;
+  st["tree_gave_up"] = r.tree_gave_up;
+  st["lp_root_cut"] = r.lp_root_cut;
+  st["cuts"] = r.cuts;
+  st["cut_rounds"] = r.cut_rounds;
+  st["cut_time"] = r.cut_time;
+  st["node_fixed"] = r.node_fixed;
+  st["rins_calls"] = r.rins_calls;
+  st["rins_found"] = r.rins_found;
   d["stats"] = st;
   return d;
 }
@@ -115,7 +123,7 @@ PYBIND11_MODULE(_core, m) {
       "solve_sc",
       [](DArr cost, LArr row_ptr, IArr col_idx, LArr side_ptr, IArr side_idx, DArr side_val, DArr side_rhs,
          double offset, double time_limit, int threads, std::uint64_t seed, double mip_gap, py::object warm,
-         bool presolve, bool local_search, bool enumerate, bool bnb) {
+         bool presolve, bool local_search, bool enumerate, bool bnb, double tree_giveup, int cuts) {
         const scsp::Problem p = make_problem(cost, row_ptr, col_idx, side_ptr, side_idx, side_val, side_rhs, offset);
         scsp::SolveOptions o;
         o.time_limit = time_limit;
@@ -126,6 +134,8 @@ PYBIND11_MODULE(_core, m) {
         o.local_search = local_search;
         o.enumerate = enumerate;
         o.bnb = bnb;
+        o.tree_giveup = tree_giveup;
+        o.cuts = cuts;
         std::vector<int> w;
         const bool has_warm = !warm.is_none();
         if (has_warm) {
@@ -144,12 +154,13 @@ PYBIND11_MODULE(_core, m) {
       py::arg("side_val"), py::arg("side_rhs"), py::arg("offset") = 0.0, py::arg("time_limit") = 10.0,
       py::arg("threads") = 4, py::arg("seed") = 1, py::arg("mip_gap") = 0.0, py::arg("warm") = py::none(),
       py::arg("presolve") = true, py::arg("local_search") = true, py::arg("enumerate") = true, py::arg("bnb") = true,
+      py::arg("tree_giveup") = 3.0, py::arg("cuts") = -1,
       "Set covering heuristic (cover rows + packing side constraints).");
 
   m.def(
       "solve_bin",
       [](DArr cost, LArr row_ptr, IArr col_idx, DArr val, DArr row_lo, DArr row_up, double offset, double time_limit,
-         int threads, std::uint64_t seed, double mip_gap, py::object warm) {
+         int threads, std::uint64_t seed, double mip_gap, py::object warm, bool local_search, int cuts) {
         const int n = static_cast<int>(cost.size());
         const int nr = static_cast<int>(row_ptr.size()) - 1;
         if (nr < 0 || row_lo.size() != nr || row_up.size() != nr) throw py::value_error("array sizes do not match");
@@ -165,6 +176,8 @@ PYBIND11_MODULE(_core, m) {
         o.threads = threads;
         o.seed = seed;
         o.mip_gap = mip_gap;
+        o.local_search = local_search;
+        o.cuts = cuts;
         std::vector<int> w;
         const bool has_warm = !warm.is_none();
         if (has_warm) w = warm.cast<std::vector<int>>();
@@ -177,7 +190,7 @@ PYBIND11_MODULE(_core, m) {
       },
       py::arg("cost"), py::arg("row_ptr"), py::arg("col_idx"), py::arg("val"), py::arg("row_lo"), py::arg("row_up"),
       py::arg("offset") = 0.0, py::arg("time_limit") = 10.0, py::arg("threads") = 4, py::arg("seed") = 1,
-      py::arg("mip_gap") = 0.0, py::arg("warm") = py::none(),
+      py::arg("mip_gap") = 0.0, py::arg("warm") = py::none(), py::arg("local_search") = true, py::arg("cuts") = -1,
       "General 0-1 path: LP-based branch and bound for models with partitioning or packing rows.");
 
   py::class_<scsp::LpSolver>(m, "LpSolver",
@@ -241,13 +254,34 @@ PYBIND11_MODULE(_core, m) {
         }
         if (!s.set_basis(b)) throw py::value_error("not a basis: need one status per row and column and exactly n_rows basic entries");
       }, py::arg("basis"))
-      .def("add_rows", [](scsp::LpSolver&, py::args, py::kwargs) {
-        PyErr_SetString(PyExc_NotImplementedError, "LpSolver.add_rows is implemented in P4 (cutting planes)");
-        throw py::error_already_set();
-      })
-      .def("remove_rows", [](scsp::LpSolver&, py::args, py::kwargs) {
-        PyErr_SetString(PyExc_NotImplementedError, "LpSolver.remove_rows is implemented in P4 (cutting planes)");
-        throw py::error_already_set();
+      .def("add_rows", [](scsp::LpSolver& s, std::vector<int> row_ptr, std::vector<int> col_idx, std::vector<double> val,
+                          std::vector<double> row_lo, std::vector<double> row_up) {
+        try {
+          s.add_rows(row_ptr, col_idx, val, row_lo, row_up);
+        } catch (const std::invalid_argument& e) {
+          throw py::value_error(e.what());
+        }
+      }, py::arg("row_ptr"), py::arg("col_idx"), py::arg("val"), py::arg("row_lo"), py::arg("row_up"),
+           "Append rows (row-wise CSR over the loaded columns); the next solve() continues from the last basis.")
+      .def("remove_rows", [](scsp::LpSolver& s, py::object rows) {
+        try {
+          if (py::isinstance<py::int_>(rows)) s.remove_rows(rows.cast<int>());
+          else s.remove_rows(rows.cast<std::vector<int>>());
+        } catch (const std::invalid_argument& e) {
+          throw py::value_error(e.what());
+        }
+      }, py::arg("rows"), "Remove the listed rows, or with an int that row and every later one.")
+      .def("row_status", [](const scsp::LpSolver& s) {
+        const std::vector<char> b = s.row_status();
+        py::array_t<std::int8_t> a(b.size());
+        auto w = a.mutable_unchecked<1>();
+        for (size_t i = 0; i < b.size(); ++i) w(i) = static_cast<std::int8_t>(b[i]);
+        return a;
+      }, "0 where the row variable is basic (the row is not tight), 1 / 2 at the lower / upper side.")
+      .def_property_readonly("row_activity", [](const scsp::LpSolver& s) {
+        std::vector<double> v;
+        s.get_row_activity(v);
+        return py::array_t<double>(v.size(), v.data());
       })
       .def_property_readonly("obj", &scsp::LpSolver::obj)
       .def_property_readonly("x", [](const scsp::LpSolver& s) {

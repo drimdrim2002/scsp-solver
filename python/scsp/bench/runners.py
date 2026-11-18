@@ -339,6 +339,8 @@ CONFIGS = {
     "highs": (run_highs, {}),
     # same heuristic setting as the DMS competition code (HighsSP.py)
     "highs-dms": (run_highs, {"mip_heuristic_effort": 0.3}),
+    # HiGHS 1.16.0 with presolve on can misprice a user start (see docs/p4_report.md); this is the workaround
+    "highs-nopre": (run_highs, {"presolve": "off"}),
     "scsp": (run_scsp, {}),
     # the P1 heuristic alone (no root LP, no branch and bound); only covering models
     "scsp-p1": (run_scsp, {"bnb": False}),

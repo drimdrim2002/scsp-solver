@@ -136,7 +136,8 @@ basis = lp.get_basis(); lp.set_basis(basis)
 lp.set_cutoff(z)                           # dual 목적값이 z를 넘으면 "cutoff". None이면 해제
 ```
 
-`add_rows` / `remove_rows`(컷)는 P4에서 구현한다. 지금은 호출하면 `NotImplementedError`가 난다.
+컷은 `lp.add_rows(row_ptr, col_idx, val, row_lo, row_up)`로 넣는다(행 단위 CSR, 열 번호는 올린 열 기준). 다음 `solve()`가
+직전 기저에서 dual simplex로 이어 푼다. `lp.remove_rows([...])`는 지울 행이 모두 느슨하면(`lp.row_status()`가 0) 기저를 유지한다.
 
 DMS 코드에서는 import 한 줄만 바꾼다(`myalgorithm.py`는 이 저장소에서 건드리지 않았다).
 

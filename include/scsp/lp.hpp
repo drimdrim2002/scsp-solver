@@ -80,13 +80,27 @@ class LpSolver {
   void set_cutoff(double cutoff);               // infinity switches it off
   double cutoff() const;
   void set_col_bounds(int k, double lb, double ub);
-  // Cutting planes: declared in P3, implemented in P4. Both throw std::logic_error until then.
+  // Cutting planes (P4). Rows are given row-wise over the loaded columns. A new row starts with its row
+  // variable basic, so the next solve() continues with the dual simplex from the last basis. Removing rows
+  // keeps the basis when every removed row has its row variable basic (see row_status), else the next
+  // solve() starts from scratch. Both throw std::invalid_argument on bad input.
   void add_rows(const std::vector<int>& row_ptr, const std::vector<int>& col_idx, const std::vector<double>& val,
                 const std::vector<double>& row_lo, const std::vector<double>& row_up);
-  void remove_rows(int first_row);
+  void remove_rows(const std::vector<int>& rows);
+  void remove_rows(int first_row);              // this row and every later one
+  void get_row_activity(std::vector<double>& a) const;   // A x of the last solve
+  std::vector<char> row_status() const;         // 0 = row variable basic (the row is not tight), else at a side
   void set_col_cost(int k, double cost);
   std::vector<char> get_basis() const;          // one status per row, then per column
   bool set_basis(const std::vector<char>& basis);
+  // A basis together with the pricing weights that go with it; restoring it is cheaper to continue from
+  // than set_basis alone (strong branching returns to the node this way).
+  struct State {
+    std::vector<char> basis;
+    std::vector<double> weights;
+  };
+  void save_state(State& s) const;
+  bool restore_state(const State& s);
   double obj() const;                           // objective of the last solve, offset included
   void get_x(std::vector<double>& x) const;
   void get_red_cost(std::vector<double>& d) const;

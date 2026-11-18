@@ -20,6 +20,12 @@ struct SolveOptions {
   bool local_search = true;
   bool enumerate = true;
   bool bnb = true;           // one thread runs the root LP and LP-based branch and bound (P3)
+  // The tree thread is handed back to the heuristic when the tree's bound, at its latest rate, needs more
+  // than tree_giveup times the time that is left (0: never hand it back). See run_hybrid.
+  double tree_giveup = 3.0;
+  // cutting planes at the root of the tree (bnb.hpp: 1 zero-half covering, 2 zero-half packing, 4 clique);
+  // -1 = automatic: 1 for covering models, 7 on the general 0-1 path
+  int cuts = -1;
 };
 
 struct TracePoint {
@@ -46,6 +52,11 @@ struct SolveResult {
   double lp_root = 0.0, lp_root_time = 0.0;   // root LP value of the reduced problem (NaN if not solved)
   long long bnb_nodes = 0, bnb_lp_iters = 0, bnb_strong = 0;
   int bnb_cols = 0;
+  double tree_gave_up = -1.0;   // time at which the tree thread was handed back to the heuristic (-1: never)
+  double lp_root_cut = 0.0;     // root LP value after the cut rounds
+  int cuts = 0, cut_rounds = 0;
+  double cut_time = 0.0;
+  long long node_fixed = 0, rins_calls = 0, rins_found = 0;
 };
 
 // `warm`: optional feasible solution (original column indices). The returned

@@ -167,6 +167,12 @@ class Simplex {
     return true;
   }
 
+  // The dual steepest edge weights belong to the basis: with them a restored basis prices as well as before.
+  const std::vector<double>& weights() const { return dse; }
+  void set_weights(const std::vector<double>& w) {
+    if (static_cast<int>(w.size()) == m) dse = w;
+  }
+
   double objective() const {
     double s = 0.0;
     for (int v = m; v < m + nc; ++v) s += c0[v] * x[v];
@@ -787,24 +793,52 @@ struct LpSolver::Impl {
   Timer timer;
   LpOptions opt;
   double cs = 1.0, offset = 0.0;
-  int m = 0;
+  int m = 0, nc = 0;
   bool first = true;
   double cutoff = INF;
-  Simplex S;
+  long iters_base = 0;  // iterations of the simplex objects replaced by add_rows / remove_rows
+  // the loaded problem (rows grow with add_rows): row sides, columns with scaled costs
+  std::vector<double> rlo, rup, cost;
+  std::vector<int> cptr, cidx;
+  std::vector<double> cval;
+  std::unique_ptr<Simplex> S;
+
   Impl(const LpProblem& P, const std::vector<int>& cols, const LpOptions& o)
-      : opt(o), offset(P.offset), m(P.m), S(P.m, P.rlo.data(), P.rup.data(), opt, timer) {
+      : opt(o), offset(P.offset), m(P.m), rlo(P.rlo), rup(P.rup) {
     double cmax = 0.0;
     for (double cj : P.cost) cmax = std::max(cmax, std::fabs(cj));
     cs = cmax > 0.0 ? cmax : 1.0;
+    std::vector<double> lb, ub;
+    cptr.assign(1, 0);
     auto add = [&](int j) {
-      S.add_column(P.cidx.data() + P.cptr[j], P.cval.data() + P.cptr[j], P.cptr[j + 1] - P.cptr[j], P.cost[j] / cs,
-                   P.lb[j], P.ub[j]);
+      cidx.insert(cidx.end(), P.cidx.begin() + P.cptr[j], P.cidx.begin() + P.cptr[j + 1]);
+      cval.insert(cval.end(), P.cval.begin() + P.cptr[j], P.cval.begin() + P.cptr[j + 1]);
+      cptr.push_back(static_cast<int>(cidx.size()));
+      cost.push_back(P.cost[j] / cs);
+      lb.push_back(P.lb[j]);
+      ub.push_back(P.ub[j]);
     };
     if (cols.empty())
       for (int j = 0; j < P.n; ++j) add(j);
     else
       for (int j : cols) add(j);
-    S.finalize();
+    nc = static_cast<int>(cost.size());
+    build(lb, ub, nullptr);
+  }
+
+  // A new simplex object for the current rows and columns; `basis` (rows, then columns) is taken over if given.
+  void build(const std::vector<double>& lb, const std::vector<double>& ub, const std::vector<char>* basis) {
+    if (S) iters_base += S->it_dual + S->it_primal;
+    S.reset(new Simplex(m, rlo.data(), rup.data(), opt, timer));
+    for (int k = 0; k < nc; ++k)
+      S->add_column(cidx.data() + cptr[k], cval.data() + cptr[k], cptr[k + 1] - cptr[k], cost[k], lb[k], ub[k]);
+    S->finalize();
+    first = !(basis && S->set_basis(*basis));
+  }
+
+  void column_bounds(std::vector<double>& lb, std::vector<double>& ub) const {
+    lb.assign(S->lo.begin() + m, S->lo.end());
+    ub.assign(S->up.begin() + m, S->up.end());
   }
 };
 
@@ -815,42 +849,162 @@ LpSolver::~LpSolver() = default;
 LpSolver::Status LpSolver::solve() { return solve(impl_->cutoff, -1); }
 void LpSolver::set_cutoff(double cutoff) { impl_->cutoff = cutoff; }
 double LpSolver::cutoff() const { return impl_->cutoff; }
-void LpSolver::add_rows(const std::vector<int>&, const std::vector<int>&, const std::vector<double>&,
-                        const std::vector<double>&, const std::vector<double>&) {
-  throw std::logic_error("LpSolver::add_rows is implemented in P4 (cutting planes)");
+
+// New rows start with their row variable basic, so the old basis stays a basis and stays dual feasible:
+// the next solve() is a dual simplex run that only has to repair the rows the current point violates.
+void LpSolver::add_rows(const std::vector<int>& row_ptr, const std::vector<int>& col_idx, const std::vector<double>& val,
+                        const std::vector<double>& row_lo, const std::vector<double>& row_up) {
+  Impl& I = *impl_;
+  const int r = static_cast<int>(row_lo.size());
+  if (static_cast<int>(row_ptr.size()) != r + 1 || static_cast<int>(row_up.size()) != r || row_ptr.front() != 0 ||
+      col_idx.size() != val.size() || row_ptr.back() != static_cast<int>(col_idx.size()))
+    throw std::invalid_argument("LpSolver::add_rows: inconsistent arrays");
+  for (int i = 0; i < r; ++i)
+    if (row_ptr[i] > row_ptr[i + 1]) throw std::invalid_argument("LpSolver::add_rows: row_ptr must not decrease");
+  for (int k : col_idx)
+    if (k < 0 || k >= I.nc) throw std::invalid_argument("LpSolver::add_rows: column index out of range");
+  if (r == 0) return;
+  std::vector<double> lb, ub;
+  I.column_bounds(lb, ub);
+  // merge the new entries into the column-wise matrix (rows inside a column stay sorted: the new rows come last)
+  std::vector<int> extra(I.nc, 0);
+  for (int k : col_idx) ++extra[k];
+  std::vector<int> nptr(I.nc + 1, 0);
+  for (int k = 0; k < I.nc; ++k) nptr[k + 1] = nptr[k] + (I.cptr[k + 1] - I.cptr[k]) + extra[k];
+  std::vector<int> nidx(nptr.back());
+  std::vector<double> nval(nptr.back());
+  std::vector<int> pos(I.nc);
+  for (int k = 0; k < I.nc; ++k) {
+    const int len = I.cptr[k + 1] - I.cptr[k];
+    std::copy(I.cidx.begin() + I.cptr[k], I.cidx.begin() + I.cptr[k + 1], nidx.begin() + nptr[k]);
+    std::copy(I.cval.begin() + I.cptr[k], I.cval.begin() + I.cptr[k + 1], nval.begin() + nptr[k]);
+    pos[k] = nptr[k] + len;
+  }
+  for (int i = 0; i < r; ++i)
+    for (int q = row_ptr[i]; q < row_ptr[i + 1]; ++q) {
+      const int k = col_idx[q];
+      nidx[pos[k]] = I.m + i;
+      nval[pos[k]++] = val[q];
+    }
+  const std::vector<char>& old = I.S->basis();
+  std::vector<char> basis(old.begin(), old.begin() + I.m);
+  basis.insert(basis.end(), r, static_cast<char>(Simplex::BASIC));
+  basis.insert(basis.end(), old.begin() + I.m, old.end());
+  const bool had = !I.first;
+  I.cptr.swap(nptr);
+  I.cidx.swap(nidx);
+  I.cval.swap(nval);
+  I.rlo.insert(I.rlo.end(), row_lo.begin(), row_lo.end());
+  I.rup.insert(I.rup.end(), row_up.begin(), row_up.end());
+  I.m += r;
+  I.build(lb, ub, had ? &basis : nullptr);
 }
-void LpSolver::remove_rows(int) { throw std::logic_error("LpSolver::remove_rows is implemented in P4 (cutting planes)"); }
+
+// The basis survives when every removed row has its row variable basic (a row that is not tight); otherwise the
+// next solve() starts from scratch.
+void LpSolver::remove_rows(const std::vector<int>& rows) {
+  Impl& I = *impl_;
+  std::vector<char> gone(I.m, 0);
+  for (int i : rows) {
+    if (i < 0 || i >= I.m) throw std::invalid_argument("LpSolver::remove_rows: row index out of range");
+    gone[i] = 1;
+  }
+  std::vector<int> map(I.m, -1);
+  int nm = 0;
+  for (int i = 0; i < I.m; ++i)
+    if (!gone[i]) map[i] = nm++;
+  if (nm == I.m) return;
+  std::vector<double> lb, ub;
+  I.column_bounds(lb, ub);
+  const std::vector<char>& old = I.S->basis();
+  std::vector<char> basis;
+  bool keep = !I.first;
+  for (int i = 0; i < I.m; ++i) {
+    if (!gone[i]) basis.push_back(old[i]);
+    else if (old[i] != Simplex::BASIC) keep = false;
+  }
+  basis.insert(basis.end(), old.begin() + I.m, old.end());
+  std::vector<int> nptr(1, 0), nidx;
+  std::vector<double> nval, nlo, nup;
+  for (int k = 0; k < I.nc; ++k) {
+    for (int q = I.cptr[k]; q < I.cptr[k + 1]; ++q)
+      if (map[I.cidx[q]] >= 0) {
+        nidx.push_back(map[I.cidx[q]]);
+        nval.push_back(I.cval[q]);
+      }
+    nptr.push_back(static_cast<int>(nidx.size()));
+  }
+  for (int i = 0; i < I.m; ++i)
+    if (!gone[i]) {
+      nlo.push_back(I.rlo[i]);
+      nup.push_back(I.rup[i]);
+    }
+  I.cptr.swap(nptr);
+  I.cidx.swap(nidx);
+  I.cval.swap(nval);
+  I.rlo.swap(nlo);
+  I.rup.swap(nup);
+  I.m = nm;
+  I.build(lb, ub, keep ? &basis : nullptr);
+}
+
+void LpSolver::remove_rows(int first_row) {
+  if (first_row < 0 || first_row > impl_->m) throw std::invalid_argument("LpSolver::remove_rows: row index out of range");
+  std::vector<int> rows;
+  for (int i = first_row; i < impl_->m; ++i) rows.push_back(i);
+  remove_rows(rows);
+}
 
 LpSolver::Status LpSolver::solve(double cutoff, long max_iter) {
   Impl& I = *impl_;
-  I.S.cutoff = cutoff < INF ? (cutoff - I.offset) / I.cs : INF;
-  I.S.iter_cap = max_iter;
-  const int s = I.S.solve(I.first);
+  I.S->cutoff = cutoff < INF ? (cutoff - I.offset) / I.cs : INF;
+  I.S->iter_cap = max_iter;
+  const int s = I.S->solve(I.first);
   I.first = false;
   return static_cast<Status>(s);
 }
-void LpSolver::set_col_bounds(int k, double lb, double ub) { impl_->S.set_bounds(impl_->m + k, lb, ub); }
-void LpSolver::set_col_cost(int k, double cost) { impl_->S.change_cost(impl_->m + k, cost / impl_->cs); }
-std::vector<char> LpSolver::get_basis() const { return impl_->S.basis(); }
-bool LpSolver::set_basis(const std::vector<char>& b) { return impl_->S.set_basis(b); }
-double LpSolver::obj() const { return impl_->S.objective() * impl_->cs + impl_->offset; }
-int LpSolver::cols() const { return impl_->S.nc; }
+void LpSolver::set_col_bounds(int k, double lb, double ub) { impl_->S->set_bounds(impl_->m + k, lb, ub); }
+void LpSolver::set_col_cost(int k, double cost) {
+  impl_->cost[k] = cost / impl_->cs;
+  impl_->S->change_cost(impl_->m + k, cost / impl_->cs);
+}
+std::vector<char> LpSolver::get_basis() const { return impl_->S->basis(); }
+bool LpSolver::set_basis(const std::vector<char>& b) { return impl_->S->set_basis(b); }
+void LpSolver::save_state(State& s) const {
+  s.basis = impl_->S->basis();
+  s.weights = impl_->S->weights();
+}
+bool LpSolver::restore_state(const State& s) {
+  if (!impl_->S->set_basis(s.basis)) return false;
+  impl_->S->set_weights(s.weights);
+  return true;
+}
+double LpSolver::obj() const { return impl_->S->objective() * impl_->cs + impl_->offset; }
+int LpSolver::cols() const { return impl_->nc; }
 int LpSolver::rows() const { return impl_->m; }
-long LpSolver::iterations() const { return impl_->S.it_dual + impl_->S.it_primal; }
+long LpSolver::iterations() const { return impl_->iters_base + impl_->S->it_dual + impl_->S->it_primal; }
 void LpSolver::get_x(std::vector<double>& x) const {
   const Impl& I = *impl_;
-  x.assign(I.S.x.begin() + I.m, I.S.x.end());
+  x.assign(I.S->x.begin() + I.m, I.S->x.end());
+}
+void LpSolver::get_row_activity(std::vector<double>& a) const {
+  const Impl& I = *impl_;
+  a.assign(I.S->x.begin(), I.S->x.begin() + I.m);
+}
+std::vector<char> LpSolver::row_status() const {
+  const Impl& I = *impl_;
+  return std::vector<char>(I.S->basis().begin(), I.S->basis().begin() + I.m);
 }
 void LpSolver::get_red_cost(std::vector<double>& d) const {
   const Impl& I = *impl_;
-  d.resize(I.S.nc);
-  for (int k = 0; k < I.S.nc; ++k) d[k] = I.S.d[I.m + k] * I.cs;
+  d.resize(I.nc);
+  for (int k = 0; k < I.nc; ++k) d[k] = I.S->d[I.m + k] * I.cs;
 }
 bool LpSolver::get_row_dual(std::vector<double>& y) {
   Impl& I = *impl_;
-  if (!I.S.refresh()) return false;
+  if (!I.S->refresh()) return false;
   y.resize(I.m);
-  for (int i = 0; i < I.m; ++i) y[i] = I.S.y[i] * I.cs;
+  for (int i = 0; i < I.m; ++i) y[i] = I.S->y[i] * I.cs;
   return true;
 }
 
