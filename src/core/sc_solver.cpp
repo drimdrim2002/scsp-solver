@@ -39,7 +39,6 @@ constexpr double INF = std::numeric_limits<double>::infinity();
 constexpr double NaN = std::numeric_limits<double>::quiet_NaN();
 static const bool DEBUG_SUB = std::getenv("SCSP_DEBUG_SUB") != nullptr;
 static const bool DEBUG_TREE = std::getenv("SCSP_DEBUG_TREE") != nullptr;
-static const bool NO_LP_ADOPT = std::getenv("SCSP_NO_LP_ADOPT") != nullptr;  // experiment: workers ignore the root LP
 
 struct Shared {
   const Problem& P;
@@ -807,7 +806,7 @@ class Worker {
   // fraction pi of the rows is covered, then restart from the root multipliers.
   void refine_fix(double pi, double noise) {
     unfix_all();
-    if (!lp_adopted && !NO_LP_ADOPT && S.lp_ready.load(std::memory_order_acquire)) {
+    if (!lp_adopted && S.lp_ready.load(std::memory_order_acquire)) {
       // The root LP only tightens reduced-cost fixing here. Its duals are a vertex of the dual
       // polyhedron (many zeros) and make worse greedy solutions than the subgradient multipliers.
       lp_adopted = true;
@@ -1519,6 +1518,7 @@ SolveResult solve_sc(const Problem& orig, const SolveOptions& opt, const std::ve
   res.enum_nodes = S.enum_nodes;
   res.passes = S.passes;
   res.lp_root = NaN;
+  res.tree_gave_up = S.tree_gave_up;
   if (S.bnb_ran) {
     static const char* names[] = {"exhausted", "stopped", "failed", "lp_infeasible"};
     res.bnb_status = names[S.bnb.status];
@@ -1528,7 +1528,6 @@ SolveResult solve_sc(const Problem& orig, const SolveOptions& opt, const std::ve
     res.bnb_lp_iters = S.bnb.lp_iters;
     res.bnb_strong = S.bnb.strong_lps;
     res.bnb_cols = S.bnb.lp_cols;
-    res.tree_gave_up = S.tree_gave_up;
     res.lp_root_cut = S.bnb.root_cut + P.offset;
     res.cuts = S.bnb.cuts;
     res.cut_rounds = S.bnb.cut_rounds;

@@ -3,14 +3,14 @@
 Set covering / set partitioning 전용 MIP 솔버(C++17 코어 + pybind11). 공개 문헌만 보고 다시 구현하는
 클린룸 프로젝트다. 설계와 단계는 [docs/design.md](docs/design.md), 결과는 [docs/p0_report.md](docs/p0_report.md)(하네스),
 [docs/p1_report.md](docs/p1_report.md)(SC 휴리스틱), [docs/p2_report.md](docs/p2_report.md)(LP 엔진),
-[docs/p3_report.md](docs/p3_report.md)(정확해법), 기법별 출처는 [docs/references.md](docs/references.md).
+[docs/p3_report.md](docs/p3_report.md)(정확해법), [docs/p4_report.md](docs/p4_report.md)(B&C 강화), 기법별 출처는 [docs/references.md](docs/references.md).
 
-**현재 상태: P0(하네스), P1(SC 휴리스틱), P2(LP 엔진), P3(정확해법)까지 구현됨.** `scsp.solve`는 두 경로로 푼다.
+**현재 상태: P0(하네스), P1(SC 휴리스틱), P2(LP 엔진), P3(정확해법), P4(B&C 강화)까지 구현됨.** `scsp.solve`는 두 경로로 푼다.
 
-- 커버 행(≥ 1)과 `≤` 부가 제약(계수 ≥ 0)으로 된 모델: Lagrangian 휴리스틱(3스레드) + 루트 LP와 LP 기반 branch and bound(1스레드).
-- 그 밖의 모델(분할 = 1 행, 묶음 ≤ 1 행, 다른 부가 제약): LP 기반 branch and bound(1스레드, 순수 분할이면 Ryan–Foster 분기).
+- 커버 행(≥ 1)과 `≤` 부가 제약(계수 ≥ 0)으로 된 모델: Lagrangian 휴리스틱(3스레드) + 루트 LP·zero-half 컷·LP 기반 branch-and-cut(1스레드, RINS·노드별 고정·큰 문제 트리 반환 포함).
+- 그 밖의 모델(분할 = 1 행, 묶음 ≤ 1 행, 다른 부가 제약): 분할 presolve + 루트 컷(zero-half·odd-hole·clique) + LP 기반 branch-and-cut(1스레드) + 병렬 LNS/RINS(`threads - 1`스레드).
 
-절단평면과 conflict graph(P4), 병렬 트리 탐색(P5)은 아직 없다.
+병렬 트리 탐색(P5)은 아직 없다.
 
 ## 클린룸 규칙 (요약)
 
@@ -34,7 +34,7 @@ python -I -m pytest -q tests
 
 | 경로 | 내용 |
 |---|---|
-| `include/scsp`, `src/core` | C++ 코어: `problem`(모델), `presolve`, `sc_solver`(Lagrangian 엔진·local search·탐색), `lu`(기저 LU 분해), `lp`(dual·primal simplex, sifting, 이어 풀기용 `LpSolver`), `bnb`(LP 기반 branch and bound), `bin_solver`(일반 0-1 경로) |
+| `include/scsp`, `src/core` | C++ 코어: `problem`(모델), `presolve`, `sc_solver`(Lagrangian 엔진·local search·탐색·트리 반환), `lu`(기저 LU 분해), `lp`(dual·primal simplex, sifting, 이어 풀기·행 추가용 `LpSolver`), `cuts`(zero-half·odd-hole·clique 컷), `bnb`(LP 기반 branch-and-cut·RINS), `bin_solver`(일반 0-1 경로·분할 presolve·병렬 LNS/RINS) |
 | `src/bindings` | pybind11 모듈 `scsp._core` (`solve_sc`, `solve_bin`, `presolve_sc`, `solve_lp`, `LpSolver`) |
 | `python/scsp/lp.py` | `scsp.solve_lp(model, method)` — LP 완화, 행 쌍대값과 reduced cost. `scsp.LpSolver` — 이어 푸는 LP |
 | `python/scsp/solve.py` | `scsp.solve(model, time_limit, threads, seed, warm_start, ...)` |

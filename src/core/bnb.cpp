@@ -953,19 +953,7 @@ SubProblem make_sub(const LpProblem& L, const std::vector<int>& freec, const std
   return S;
 }
 
-BnbResult branch_and_bound(const LpProblem& P, const BnbHooks& H, const BnbOptions& opt_in) {
-  BnbOptions opt = opt_in;
-  // experiment knobs (not part of the interface)
-  if (const char* e = std::getenv("SCSP_CUT_TIME")) opt.cut_time = std::atof(e);
-  if (const char* e = std::getenv("SCSP_CUT_SIZE")) opt.cut_size = std::atoi(e);
-  if (const char* e = std::getenv("SCSP_CUT_ROUNDS")) opt.cut_rounds = std::atoi(e);
-  if (std::getenv("SCSP_ROOT_ONLY") && opt.node_limit < 0) opt.node_limit = 1;
-  if (const char* e = std::getenv("SCSP_RF")) opt.ryan_foster = std::atoi(e) != 0;
-  if (const char* e = std::getenv("SCSP_SB_ITERS")) opt.strong_iters = std::atol(e);
-  if (const char* e = std::getenv("SCSP_SB_CANDS")) opt.strong_cands = std::atoi(e);
-  if (const char* e = std::getenv("SCSP_SB_LOOK")) opt.strong_lookahead = std::atoi(e);
-  if (const char* e = std::getenv("SCSP_REL")) opt.reliability = std::atoi(e);
-  if (const char* e = std::getenv("SCSP_RINS")) opt.rins = std::atoi(e) != 0;
+BnbResult branch_and_bound(const LpProblem& P, const BnbHooks& H, const BnbOptions& opt) {
   BnbResult R;
   const auto t0 = Clock::now();
   auto elapsed = [&]() { return std::chrono::duration<double>(Clock::now() - t0).count(); };

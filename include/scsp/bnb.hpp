@@ -39,7 +39,7 @@ struct BnbOptions {
   int strong_cands = 8;        // candidates tried by strong branching per node
   long strong_iters = 100;     // dual simplex iterations per strong branching LP
   int reliability = 2;         // pseudocost observations before a variable is trusted
-  int strong_lookahead = 8;    // candidates in a row without a better score before strong branching stops
+  int strong_lookahead = 4;    // candidates in a row without a better score before strong branching stops
   double strong_share = 1.0 / 3.0;  // share of all LP iterations strong branching may use below depth 8
   bool node_basis = true;      // a queued node keeps its parent's optimal basis
   bool node_fixing = true;     // reduced cost fixing at every node (for the rest of the plunge)
@@ -52,7 +52,7 @@ struct BnbOptions {
   // RINS inside the tree (Danna, Rothberg & Le Pape 2005): now and then the columns on which the node LP
   // and the incumbent agree are fixed and the rest is solved as a small problem of its own
   bool rins = false;
-  bool ryan_foster = true;     // use Ryan-Foster branching when every row is an equality with rhs 1
+  bool ryan_foster = false;    // optional Ryan-Foster branching for pure partitioning; default off (reliability var branching is stronger)
   long node_limit = -1;
   double root_time_limit = 1e30;  // seconds for the root LP; the search is given up if it takes longer
 };
