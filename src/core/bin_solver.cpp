@@ -36,6 +36,7 @@ SolveResult solve_core(const LpProblem& L, const SolveOptions& opt, const std::v
   std::mutex mu;
   std::vector<int> best;
   double ub = INF, lb = -INF, last_lb_trace = -1.0;  // costs without the offset
+  std::atomic<double> cur_ub{INF}, cur_lb{-INF};
   auto shown = [&](double l) {
     if (l == -INF) return NaN;
     double b = l + L.offset;
@@ -63,6 +64,7 @@ SolveResult solve_core(const LpProblem& L, const SolveOptions& opt, const std::v
     if (cost >= ub - 1e-12 * std::max(1.0, std::fabs(cost))) return;
     best = cols;
     ub = cost;
+    cur_ub.store(cost, std::memory_order_relaxed);
     res.trace.push_back({elapsed(), cost + L.offset, shown(lb), 0});
   };
 
@@ -195,6 +197,7 @@ SolveResult solve_core(const LpProblem& L, const SolveOptions& opt, const std::v
     return st;
   };
 
+  BnbTeam team;
   BnbHooks H;
   H.thr = thr;
   H.offer = offer;
@@ -202,6 +205,7 @@ SolveResult solve_core(const LpProblem& L, const SolveOptions& opt, const std::v
     std::lock_guard<std::mutex> g(mu);
     if (l <= lb) return;
     lb = l;
+    cur_lb.store(l, std::memory_order_relaxed);
     const double t = elapsed();
     if (t - last_lb_trace >= 0.1) {
       last_lb_trace = t;
@@ -210,6 +214,7 @@ SolveResult solve_core(const LpProblem& L, const SolveOptions& opt, const std::v
   };
   H.stop = [&]() { return elapsed() >= opt.time_limit; };
   const int nt = std::max(1, opt.threads);
+  if (nt > 1) H.team = &team;
   const bool lns = opt.local_search && L.n > 0 && L.m > 0;
   if (lns) {
     H.root = [&](const std::vector<double>&, const std::vector<double>& d, double) {
@@ -236,16 +241,36 @@ SolveResult solve_core(const LpProblem& L, const SolveOptions& opt, const std::v
       lns_time += elapsed() - t;
     };
   }
+  // Gap-driven split between parallel B&B tree workers and LNS/RINS workers (P5):
+  // - Before an incumbent exists, all threads help the tree find one.
+  // - With a wide gap (>= 5%), keep 1 B&B + 3 LNS (strong primal improvement on large synthetic SPP).
+  // - As the relative gap narrows (< 5%, < 3.5%, < 1.5%), move workers 1, 2, 3 into parallel B&B
+  //   so provable instances scale up to 3-4 tree threads without starving LNS on hard wide-gap ones.
+  auto want_tree = [&](int w) -> bool {
+    if (!team.active()) return false;
+    if (!lns) return true;
+    const double u = cur_ub.load(std::memory_order_relaxed);
+    if (u == INF) return true;
+    const double l = cur_lb.load(std::memory_order_relaxed);
+    const double denom = std::fabs(u + L.offset);
+    const double gap = (l > -INF && denom > 1e-12) ? std::max(0.0, (u - l) / denom) : 1.0;
+    const bool close_int = integral && l > -INF && (u - std::ceil(l - 1e-6) <= 1.0 + 1e-9);
+    if (w == 1) return gap < 0.05 || close_int;
+    if (w == 2) return gap < 0.035 || close_int;
+    return gap < 0.015 || close_int;
+  };
   std::vector<std::thread> pool;
-  if (lns)
-    for (int w = 1; w < nt; ++w)
-      pool.emplace_back([&, w]() {
-        LnsState st = new_state(w);
-        while (!timeup()) {
-          if (!root_ready.load(std::memory_order_acquire) || !lns_step(st, std::max(0.2, 0.03 * opt.time_limit), 500))
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  for (int w = 1; w < nt; ++w)
+    pool.emplace_back([&, w]() {
+      LnsState st = new_state(w);
+      while (!timeup()) {
+        if (want_tree(w)) {
+          if (team.help([&]() { return !timeup() && want_tree(w); })) continue;
         }
-      });
+        if (!lns || !root_ready.load(std::memory_order_acquire) || !lns_step(st, std::max(0.2, 0.03 * opt.time_limit), 500))
+          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+    });
 
   BnbOptions o;
   o.seed = static_cast<unsigned>(opt.seed);

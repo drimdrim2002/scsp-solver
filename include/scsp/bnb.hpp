@@ -7,12 +7,35 @@
 // (Ryan & Foster 1981).
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <functional>
+#include <mutex>
 #include <vector>
 
 #include "scsp/lp.hpp"
 
 namespace scsp {
+
+// Cooperative parallel tree handle (P5): lets external threads (e.g. idle heuristic/LNS workers)
+// temporarily join an active branch-and-bound tree and leave cleanly when the tree ends or
+// `stay()` returns false.
+class BnbTeam {
+ public:
+  bool active() const { return is_active_.load(std::memory_order_acquire); }
+  bool help(const std::function<bool()>& stay);
+
+  // Used internally by branch_and_bound.
+  void activate(std::function<void(const std::function<bool()>&)> fn);
+  void deactivate();
+
+ private:
+  mutable std::mutex mu_;
+  std::condition_variable done_cv_;
+  std::function<void(const std::function<bool()>&)> fn_;
+  std::atomic<bool> is_active_{false};
+  int in_flight_ = 0;
+};
 
 // How the search talks to the rest of the solver. Costs exclude LpProblem::offset.
 struct BnbHooks {
@@ -30,6 +53,8 @@ struct BnbHooks {
   std::function<void(std::vector<int>&)> incumbent;
   // optional: called once with the root LP (row duals, reduced costs of all columns, value)
   std::function<void(const std::vector<double>&, const std::vector<double>&, double)> root;
+  // optional: external worker threads may call team->help(...) to join the active tree (P5)
+  BnbTeam* team = nullptr;
 };
 
 struct BnbOptions {
@@ -55,6 +80,7 @@ struct BnbOptions {
   bool ryan_foster = false;    // optional Ryan-Foster branching for pure partitioning; default off (reliability var branching is stronger)
   long node_limit = -1;
   double root_time_limit = 1e30;  // seconds for the root LP; the search is given up if it takes longer
+  int threads = 1;                // internal parallel tree threads (1 = caller only; > 1 spawns helpers)
 };
 
 struct BnbResult {

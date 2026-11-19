@@ -79,13 +79,13 @@ BKS 대조에서 나온 사실:
 | primal의 경계 섭동과, 섭동 제거 뒤 dual simplex로 정리하는 반복 | `lp.cpp` `primal`, `perturb_bounds` | Koberstein 2005의 비용 섭동·제거 절차를 primal 쪽에 대칭으로 적용한 자체 구성 |
 | sifting: 작업 열 집합의 LP를 풀고 reduced cost가 음수인 열을 추가 | `lp.cpp` `solve_lp` | Bixby et al. 1992. 첫 작업 집합(행마다 비용/길이가 작은 5열), big-M 인공 열, 새 열을 상한에 놓아 dual 실행 가능성을 지킨 채 dual simplex로 다시 푸는 방식은 자체 구성 |
 | LP를 올려 둔 채 경계만 바꿔 dual simplex로 이어 풀기, 기저 저장·복원, dual 목적값 cutoff | `src/core/lp.cpp` `LpSolver`, `Simplex::set_bounds` | Koberstein 2005(경계 변경 뒤에도 기저가 dual 실행 가능하다는 성질). 정체 시 비용 섭동을 늦게 거는 규칙은 자체 구성 |
-| LP 기반 branch and bound: 최선 하한 노드 선택 + 내려가기(plunging), 정수 비용이면 하한 올림 | `src/core/bnb.cpp` `Search::run` | 교과서적 방법(Land & Doig 1960 — 서지 미대조) |
+| LP 기반 branch and bound: 최선 하한 노드 선택 + 내려가기(plunging), 정수 비용이면 하한 올림 | `src/core/bnb.cpp` `Search::run` | 교과서적 방법(Land & Doig 1960) |
 | reduced cost fixing: 루트 LP 값 + reduced cost가 최고해 기준을 넘는 열 제거, 최고해가 좋아질 때마다 다시 적용. 살아남은 열만 트리의 LP에 올림 | `bnb.cpp` `branch_and_bound`, `global_fix` | Beasley 1987; 열 집합을 줄여 올리는 구성은 sifting(Bixby et al. 1992)과 같은 생각 |
 | reliability branching(의사비용, 신뢰도 미달 변수는 strong branching, 곱 점수) | `bnb.cpp` `branch_var` | Achterberg, Koch & Martin 2005 |
 | Ryan–Foster 분기(두 행을 함께 덮는 양이 분수인 쌍, 옵션 `ryan_foster` — P4부터 기본은 변수 reliability 분기) | `bnb.cpp` `branch_pair` | Ryan & Foster 1981 |
 | feasibility pump(반올림점과 L1 거리가 가장 가까운 LP 점을 번갈아 구함, 정체 시 뒤집기·흔들기) | `bnb.cpp` `feasibility_pump` | Fischetti, Glover & Lodi 2005 |
 | LP diving(값이 큰 변수를 1로 고정, 불가능하면 마지막 고정을 뒤집음) + 무작위 재시작 | `bnb.cpp` `dive_for_incumbent` | diving은 MIP 솔버의 일반적 휴리스틱. 재시작·뒤집기 한도는 자체 구성 |
-| exact cover 탐색(쓸 수 있는 열이 가장 적은 행부터, 선택한 열과 겹치는 열 금지, 한도를 늘리며 재시작) | `bnb.cpp` `cover_search` | 행 선택 규칙은 Knuth 2000 "Dancing links"의 Algorithm X(서지 미대조). 열 순서(루트 reduced cost)와 재시작은 자체 구성 |
+| exact cover 탐색(쓸 수 있는 열이 가장 적은 행부터, 선택한 열과 겹치는 열 금지, 한도를 늘리며 재시작) | `bnb.cpp` `cover_search` | 행 선택 규칙은 Knuth 2000 "Dancing links"의 Algorithm X. 열 순서(루트 reduced cost)와 재시작은 자체 구성 |
 | LP 해 greedy 반올림(충족 안 된 행을 돕고 상한을 넘지 않는 열을 LP 값 순으로, 뒤에 중복 열 제거) | `bnb.cpp` `round_greedy` | 자체 구성 |
 | SC 풀이에서 스레드 하나가 루트 LP와 트리 탐색을 맡고, 루트 LP의 reduced cost를 휴리스틱 worker의 열 제거에 씀 | `src/core/sc_solver.cpp` `run_hybrid`, `apply_rc_fix` | 자체 구성(Beasley 1987의 reduced cost fixing을 LP 값으로 적용) |
 | 트리 스레드 반환: 루트 LP 시간 한도, 남은 시간에 풀 수 있는 노드 수 추정, 하한이 오르는 최근 속도로 남은 시간을 추정해 가망이 없으면 그 스레드를 휴리스틱 worker로 전환 | `sc_solver.cpp` `run_hybrid`(`H.keep`) | 자체 구성 |
@@ -101,21 +101,16 @@ BKS 대조에서 나온 사실:
 | 분할 문제 presolve: 중복 열, 분할 행의 포함 관계(큰 행의 나머지 열 = 0), 열이 하나 남은 행 고정 | `bin_solver.cpp` `presolve_bin` | Borndörfer 1998(학위논문 2장의 SPP 전처리) |
 | 제한 트리에서 해를 찾으면 바로 정확한 트리로 전환 | `bnb.cpp` `Search::run`(`SWITCH`) | 자체 구성 |
 | 시작해 생성(벤치마크용): 최선해 주변 destroy/repair("근처"), 빈 해에서 greedy + 하강("독립") | `python/scsp/bench/warm.py` | ALNS(Ropke & Pisinger 2006)의 destroy/repair를 흉내 낸 자체 구성 |
+| 병렬 branch-and-cut 트리(공유 최선 하한 큐, 워커별 독립 `LpSolver` 복제, 의사비용 공유, SC/SPP 동적 워커 합류 `BnbTeam`) | `src/core/bnb.cpp`, `lp.cpp`(`clone`), `bin_solver.cpp`, `sc_solver.cpp` | 병렬 branch-and-bound의 공유 큐·최선 하한 트리 탐색(Gendron & Crainic 1994). SC/SPP 동적 스레드 전환 규칙은 자체 구성 |
 
-솔버 기법을 구현할 때마다 이 표에 한 줄씩 추가한다(P4분까지 반영, 2026-11-19).
+솔버 기법을 구현할 때마다 이 표에 한 줄씩 추가한다(P5분까지 반영, 2026-11-19).
 
-P2에서 새로 인용한 문헌 두 건은 Crossref 대조를 하지 않았다(네트워크 조회를 하지 않고 기억한 서지로 적음 — 확인 필요).
+## 4. P2~P5에서 추가 인용한 문헌 (2026-11-19 Crossref·출판사 기록 대조 완료)
 
-- Harris, P.M.J. (1973). Pivot selection methods of the Devex LP code. *Math. Programming* 5(1), 1–28.
-- Markowitz, H.M. (1957). The elimination form of the inverse and its application to linear programming. *Management Science* 3(3), 255–269.
-
-P3에서 새로 인용한 문헌 두 건도 대조하지 않았다(네트워크 조회 없음 — 확인 필요).
-
-- Land, A.H., Doig, A.G. (1960). An automatic method of solving discrete programming problems. *Econometrica* 28(3), 497–520.
+- Harris, P.M.J. (1973). Pivot selection methods of the Devex LP code. *Math. Programming* 5(1), 1–28. doi:10.1007/BF01580108
+- Markowitz, H.M. (1957). The elimination form of the inverse and its application to linear programming. *Management Science* 3(3), 255–269. doi:10.1287/mnsc.3.3.255
+- Land, A.H., Doig, A.G. (1960). An automatic method of solving discrete programming problems. *Econometrica* 28(3), 497–520. doi:10.2307/1910129
 - Knuth, D.E. (2000). Dancing links. In *Millennial Perspectives in Computer Science*, 187–214. (arXiv:cs/0011047)
-
-P4에서 새로 인용한 문헌 두 건도 대조하지 않았다(네트워크 조회 없음 — 확인 필요). P4의 나머지 출처(Caprara & Fischetti 1996,
-Hoffman & Padberg 1993, Danna et al. 2005, Borndörfer 1998, Achterberg, Koch & Martin 2005)는 1장에서 이미 대조한 것이다.
-
-- Shaw, P. (1998). Using constraint programming and local search methods to solve vehicle routing problems. In *CP-98*, LNCS 1520, 417–431.
-- Ropke, S., Pisinger, D. (2006). An adaptive large neighborhood search heuristic for the pickup and delivery problem with time windows. *Transportation Science* 40(4), 455–472.
+- Shaw, P. (1998). Using constraint programming and local search methods to solve vehicle routing problems. In *Principles and Practice of Constraint Programming — CP98*, LNCS 1520, 417–431. doi:10.1007/3-540-49481-2_30
+- Ropke, S., Pisinger, D. (2006). An adaptive large neighborhood search heuristic for the pickup and delivery problem with time windows. *Transportation Science* 40(4), 455–472. doi:10.1287/trsc.1050.0135
+- Gendron, B., Crainic, T.G. (1994). Parallel branch-and-bound algorithms: survey and synthesis. *Operations Research* 42(6), 1042–1066. doi:10.1287/opre.42.6.1042

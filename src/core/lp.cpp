@@ -200,7 +200,8 @@ class Simplex {
         compute_primal();
         need = false;
       }
-      if ((it_dual & 31) == 0 && timer.sec() > opt.time_limit) return LIMIT;
+      if ((it_dual & 31) == 0 && (timer.sec() > opt.time_limit || (opt.stop && opt.stop->load(std::memory_order_relaxed))))
+        return LIMIT;
       if (it_dual + it_primal >= opt.max_iter) return LIMIT;
       if (iter_cap >= 0 && it_dual - it_start >= iter_cap) return LIMIT;
       if (cutoff < INF && !cost_mod && (it_dual & 7) == 7) {
@@ -464,7 +465,8 @@ class Simplex {
         compute_dual();
         need = false;
       }
-      if ((it_primal & 31) == 0 && timer.sec() > opt.time_limit) return LIMIT;
+      if ((it_primal & 31) == 0 && (timer.sec() > opt.time_limit || (opt.stop && opt.stop->load(std::memory_order_relaxed))))
+        return LIMIT;
       if (it_dual + it_primal >= opt.max_iter) return LIMIT;
 
       int q = -1;
@@ -826,6 +828,19 @@ struct LpSolver::Impl {
     build(lb, ub, nullptr);
   }
 
+  Impl(const Impl& src, unsigned seed, double time_limit, const std::atomic<bool>* stop)
+      : opt(src.opt), cs(src.cs), offset(src.offset), m(src.m), nc(src.nc), cutoff(src.cutoff),
+        rlo(src.rlo), rup(src.rup), cost(src.cost), cptr(src.cptr), cidx(src.cidx), cval(src.cval) {
+    opt.seed = seed;
+    opt.time_limit = time_limit;
+    opt.stop = stop;
+    std::vector<double> lb, ub;
+    src.column_bounds(lb, ub);
+    const std::vector<char>& basis = src.S->basis();
+    build(lb, ub, src.first ? nullptr : &basis);
+    if (!first) S->set_weights(src.S->weights());
+  }
+
   // A new simplex object for the current rows and columns; `basis` (rows, then columns) is taken over if given.
   void build(const std::vector<double>& lb, const std::vector<double>& ub, const std::vector<char>* basis) {
     if (S) iters_base += S->it_dual + S->it_primal;
@@ -844,7 +859,13 @@ struct LpSolver::Impl {
 
 LpSolver::LpSolver(const LpProblem& p, const std::vector<int>& cols, const LpOptions& opt)
     : impl_(new Impl(p, cols, opt)) {}
+LpSolver::LpSolver(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 LpSolver::~LpSolver() = default;
+
+std::unique_ptr<LpSolver> LpSolver::clone(unsigned seed, double time_limit, const std::atomic<bool>* stop) const {
+  std::unique_ptr<Impl> copy(new Impl(*impl_, seed, time_limit, stop));
+  return std::unique_ptr<LpSolver>(new LpSolver(std::move(copy)));
+}
 
 LpSolver::Status LpSolver::solve() { return solve(impl_->cutoff, -1); }
 void LpSolver::set_cutoff(double cutoff) { impl_->cutoff = cutoff; }

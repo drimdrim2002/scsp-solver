@@ -58,6 +58,9 @@ struct Shared {
   BnbResult bnb;
   bool bnb_ran = false;
   double tree_gave_up = -1.0;  // time at which the tree thread became a heuristic worker (-1: it did not)
+  BnbTeam team;
+  std::atomic<double> last_impr_t{0.0};
+  std::atomic<bool> tree_worth_helping{false};
 
   Shared(const Problem& p, const SolveOptions& o, Clock::time_point t) : P(p), opt(o), t0(t) {}
 
@@ -93,7 +96,9 @@ struct Shared {
     if (cost >= u - 1e-12 * std::max(1.0, std::fabs(cost))) return false;
     best = sol;
     ub = cost;
-    trace.push_back({elapsed(), cost + P.offset, shown_bound(lb.load(), cost), 0});
+    const double t = elapsed();
+    last_impr_t.store(t, std::memory_order_relaxed);
+    trace.push_back({t, cost + P.offset, shown_bound(lb.load(), cost), 0});
     check_done();
     return true;
   }
@@ -144,9 +149,28 @@ class Worker {
     usage.assign(ns, 0.0);
   }
 
+  bool want_help_tree() const {
+    if (!S.team.active() || !S.tree_worth_helping.load(std::memory_order_relaxed)) return false;
+    const double u = S.ub.load(std::memory_order_relaxed);
+    if (u == INF) return false;
+    const double l = S.lb.load(std::memory_order_relaxed);
+    const double stall = S.elapsed() - S.last_impr_t.load(std::memory_order_relaxed);
+    const double denom = std::fabs(u + P.offset);
+    const double gap = (l > -INF && denom > 1e-12) ? std::max(0.0, (u - l) / denom) : 1.0;
+    const bool close_int = P.integral && l > -INF && (u - std::ceil(l - 1e-6) <= 1.0 + 1e-9);
+    // Keep worker 0 on the heuristic longest; enlist worker 1 first, then worker 3 (and others).
+    if (id == 1) return stall >= 0.8 || gap < 0.02 || close_int;
+    if (id != 0) return stall >= 1.8 || gap < 0.015 || close_int;
+    return stall >= 3.5 && (gap < 0.01 || close_int);
+  }
+
   void run() {
     begin();
-    while (!S.timeup() && pass()) {
+    while (!S.timeup()) {
+      if (want_help_tree()) {
+        if (S.team.help([this]() { return !S.timeup() && want_help_tree(); })) continue;
+      }
+      if (!pass()) break;
     }
   }
 
@@ -1254,6 +1278,7 @@ void run_hybrid(Shared& S, int id, bool with_worker, int reserve = -1) {
   H.offer = [&S](const std::vector<int>& sol, double cost) { S.offer(sol, cost); };
   H.offer_lb = [&S](double l) { S.offer_lb(l); };
   H.stop = [&S]() { return S.timeup(); };
+  if (S.opt.threads >= 2) H.team = &S.team;
   H.root = [&](const std::vector<double>& y, const std::vector<double>& d, double z) {
     S.lp_u.resize(P.m);
     S.lp_v.resize(P.ns);
@@ -1262,6 +1287,7 @@ void run_hybrid(Shared& S, int id, bool with_worker, int reserve = -1) {
     S.lp_rc = d;
     S.lp_bound = z;
     S.lp_ready.store(true, std::memory_order_release);
+    S.tree_worth_helping.store(true, std::memory_order_release);
     // a wide root gap makes a finished tree unlikely: leave most of the thread to the heuristic
     const double ub = S.ub.load();
     if (ub < INF && (ub - z) / std::max(std::fabs(ub), 1e-12) > 0.05) tree_share = share_min = 0.15, share_max = 0.3;
@@ -1322,10 +1348,12 @@ void run_hybrid(Shared& S, int id, bool with_worker, int reserve = -1) {
       for (int j = 0; j < P.n; ++j) left_cols += z + std::max(d[j], 0.0) <= thr;
       const double node = std::max(t_lp * static_cast<double>(left_cols) / std::max(1, P.n), 1e-6);
       const double nodes = (S.opt.time_limit - now) / node;
-      skip_tree = watched && nodes < (P.integral ? 300.0 : 1000.0);
+      const double min_nodes = P.integral ? std::max(300.0, 100.0 * std::max(0.0, thr - z)) : 1000.0;
+      skip_tree = watched && nodes < min_nodes;
+      if (skip_tree) S.tree_worth_helping.store(false, std::memory_order_release);
       if (DEBUG_TREE)
-        std::fprintf(stderr, "tree root t_lp=%.3f cols %ld/%d est. nodes in the time left %.0f -> %s\n", t_lp, left_cols, P.n,
-                     nodes, skip_tree ? "no tree" : "tree");
+        std::fprintf(stderr, "tree root t_lp=%.3f cols %ld/%d est. nodes in the time left %.0f (min %.0f) -> %s\n",
+                     t_lp, left_cols, P.n, nodes, min_nodes, skip_tree ? "no tree" : "tree");
     };
     H.keep = [&](double bound, long nodes) {
       if (skip_tree) return false;
@@ -1343,16 +1371,16 @@ void run_hybrid(Shared& S, int id, bool with_worker, int reserve = -1) {
       }
       if (!watched || t < t_check) return true;
       const double left = S.opt.time_limit - now;
-      if (nodes - n_last < 20) {  // too few nodes since the last reading to judge a rate
+      if (nodes - n_last < 20 && t - t_last < std::max(1.0, 0.15 * S.opt.time_limit)) {
         t_check = t * 1.25;
-        // ... unless the nodes are simply too slow: not even 20 of them in a quarter of the time limit
         return !(nodes < 20 && t > std::max(1.0, 0.25 * S.opt.time_limit));
       }
       const double d = std::max(f - f_prev, 0.0);
       const double rest = d > 1e-12 ? (1.0 - f) / d * (t - t_last) : INF;  // time for the rest at the last interval's rate
-      if (rest > 10.0 * S.opt.tree_giveup * left) strikes += 2;
+      if (rest > 5.0 * S.opt.tree_giveup * left) strikes += 2;
       else if (rest > S.opt.tree_giveup * left) ++strikes;
       else strikes = 0;
+      S.tree_worth_helping.store(strikes == 0, std::memory_order_release);
       if (DEBUG_TREE)
         std::fprintf(stderr, "tree check t=%.3f nodes=%ld f=%.4f gain=%.4f rest=%.1f s left=%.1f s strikes=%d\n", t, nodes, f, d, rest, left,
                      strikes);
@@ -1368,6 +1396,7 @@ void run_hybrid(Shared& S, int id, bool with_worker, int reserve = -1) {
   if (DEBUG_TREE && no_lp) std::fprintf(stderr, "tree: root LP estimated at %.2f s, not started\n", lp_estimate);
   if (!S.timeup() && !no_lp) {
     S.bnb = branch_and_bound(L, H, o);
+    S.tree_worth_helping.store(false, std::memory_order_release);
     S.bnb_ran = true;
     if (S.bnb.status == BnbResult::EXHAUSTED) {
       if (S.ub.load() < INF) {

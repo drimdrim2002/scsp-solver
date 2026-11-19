@@ -10,6 +10,7 @@
 // (1992) for sifting.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -42,6 +43,7 @@ struct LpOptions {
   bool perturb = true;  // cost perturbation in the dual simplex
   unsigned seed = 1;
   int sift_cap = 0;     // columns added per sifting round (0 = automatic)
+  const std::atomic<bool>* stop = nullptr;  // optional early-stop flag checked inside simplex
 };
 
 struct LpResult {
@@ -72,6 +74,11 @@ class LpSolver {
   ~LpSolver();
   LpSolver(const LpSolver&) = delete;
   LpSolver& operator=(const LpSolver&) = delete;
+
+  // Independent copy of the current loaded LP (including added/removed rows, column bounds,
+  // and optimal basis/weights) for parallel tree workers (P5).
+  std::unique_ptr<LpSolver> clone(unsigned seed, double time_limit,
+                                  const std::atomic<bool>* stop = nullptr) const;
 
   // Stops with CUTOFF as soon as the dual objective exceeds the cutoff (a proven lower bound of the LP value),
   // with LIMIT after max_iter dual iterations (-1 = no limit). solve() uses the cutoff of set_cutoff().
@@ -111,6 +118,7 @@ class LpSolver {
 
  private:
   struct Impl;
+  explicit LpSolver(std::unique_ptr<Impl> impl);
   std::unique_ptr<Impl> impl_;
 };
 

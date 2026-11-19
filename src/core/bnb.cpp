@@ -1,16 +1,52 @@
 #include "scsp/bnb.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <random>
+#include <thread>
 
 #include "scsp/cuts.hpp"
 
 namespace scsp {
+
+bool BnbTeam::help(const std::function<bool()>& stay) {
+  std::function<void(const std::function<bool()>&)> fn;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!fn_) return false;
+    fn = fn_;
+    ++in_flight_;
+  }
+  struct Guard {
+    BnbTeam* t;
+    ~Guard() {
+      std::lock_guard<std::mutex> lk(t->mu_);
+      if (--t->in_flight_ == 0) t->done_cv_.notify_all();
+    }
+  } guard{this};
+  fn(stay);
+  return true;
+}
+
+void BnbTeam::activate(std::function<void(const std::function<bool()>&)> fn) {
+  std::lock_guard<std::mutex> lk(mu_);
+  fn_ = std::move(fn);
+  is_active_.store(true, std::memory_order_release);
+}
+
+void BnbTeam::deactivate() {
+  std::unique_lock<std::mutex> lk(mu_);
+  is_active_.store(false, std::memory_order_release);
+  fn_ = nullptr;
+  done_cv_.wait(lk, [&]() { return in_flight_ == 0; });
+}
 
 namespace {
 
@@ -37,27 +73,27 @@ struct NodeCmp {
   }
 };
 
-// One tree search over a fixed subset of the columns.
+// One tree search over a fixed subset of the columns, supporting parallel workers via BnbTeam
+// and/or internal threads (P5).
 class Search {
  public:
   // SWITCH: a restricted search met its purpose (an incumbent exists); the exact search should take over
   enum { EXHAUSTED = 0, STOPPED = 1, INCOMPLETE = 2, NO_INCUMBENT = 3, SWITCH = 4 };
 
   Search(const LpProblem& P_, const BnbHooks& H_, const BnbOptions& o_, const std::vector<double>& droot_,
-         double zroot_, std::vector<int> cols_, bool exact_, double time_left, BnbResult& R_)
-      : P(P_), H(H_), o(o_), droot(droot_), zroot(zroot_), cols(std::move(cols_)), exact(exact_), R(R_) {
+         double zroot_, std::vector<int> cols_, bool exact_, double time_left_, BnbResult& R_)
+      : P(P_), H(H_), o(o_), droot(droot_), zroot(zroot_), cols(std::move(cols_)), exact(exact_),
+        time_left(time_left_), R(R_), total_nodes(R_.nodes), rins_time_acc(R_.rins_time) {
     LpOptions lo;
     lo.seed = o.seed;
     lo.time_limit = time_left;
-    lp.reset(new LpSolver(P, cols, lo));
+    lo.stop = &abort_lp;
+    lp0.reset(new LpSolver(P, cols, lo));
     nk = static_cast<int>(cols.size());
-    fv.assign(nk, -1);
     dk.resize(nk);
     for (int k = 0; k < nk; ++k) dk[k] = droot[cols[k]];
     zr0 = zroot;
-    gfix.assign(nk, 0);
-    lfix.assign(nk, 0);
-    want.assign(nk, 0);
+    cached_gb.store(zr0, std::memory_order_relaxed);
     for (int d = 0; d < 2; ++d) {
       pcs[d].assign(nk, 0.0);
       pcn[d].assign(nk, 0);
@@ -72,157 +108,77 @@ class Search {
     for (double v : P.cval)
       if (v != 1.0) pure_sp = false;
     partition = pure_sp && o.ryan_foster;
-    act.assign(P.m, 0.0);
-    if (partition) {
-      rmark.assign(P.m, 0);
-      if (static_cast<double>(P.m) * P.m <= 8e6) pairw.assign(static_cast<size_t>(P.m) * P.m, 0.0);
-      else partition = false;
-    }
+    if (partition && static_cast<double>(P.m) * P.m > 8e6) partition = false;
+    active_bound.push_back(INF);  // slot 0: main thread
   }
 
-  ~Search() { R.lp_iters += lp->iterations(); }
+  ~Search() {
+    for (Node* nd : open) delete nd;
+    open.clear();
+  }
 
   int run() {
-    auto drop_all = [&]() {
-      for (Node* nd : open) delete nd;
-      open.clear();
-    };
-    if (H.keep && exact && !H.keep(zr0, R.nodes)) {
+    if (H.keep && exact && !check_keep(zr0)) {
       R.gave_up = true;
+      R.lp_iters += lp0->iterations();
       return STOPPED;
     }
     if (o.cuts && exact && !root_cuts()) {
       R.gave_up = true;
+      R.lp_iters += lp0->iterations();
       return STOPPED;
     }
-    push(new Node());
-    bool incomplete = false;
-    std::vector<int> cand;
+    // Prepare template LP for parallel helpers right after root cuts (clean [0,1] bounds + optimal root basis).
+    const bool may_parallel = H.team != nullptr || o.threads > 1;
+    if (may_parallel) {
+      template_lp = lp0->clone(o.seed, time_left, &abort_lp);
+    }
+    push_locked(new Node());
+
+    // Build main worker (slot 0) taking ownership of lp0.
+    Worker main_w(*this, 0, std::move(lp0));
+
     // First incumbent: one LP dive (good solutions on easy problems) and, for partitioning problems,
     // the cover search. If the best-first tree has still found nothing after a while, the feasibility
     // pump and restarted dives get their turn; a restricted column set that yields nothing is given up.
     if (H.thr() == INF) {
-      bool ok = dive_for_incumbent(1, 0.1);
-      if (ok && H.thr() == INF && pure_sp) ok = cover_search(0.1);
+      bool ok = main_w.dive_for_incumbent(1, 0.1);
+      if (ok && H.thr() == INF && pure_sp) ok = main_w.cover_search(0.1);
       if (!ok) {
-        drop_all();
+        finish_worker(main_w);
+        R.nodes = total_nodes.load(std::memory_order_relaxed);
         return STOPPED;
       }
     }
-    long heur_at = H.thr() == INF ? R.nodes + 3000 : -1;
-    const double heur_time = now() + 0.1 * o.time_limit;
-    while (!open.empty()) {
-      if (stop()) {
-        drop_all();
-        return STOPPED;
-      }
-      if (H.yield) H.yield();
-      if (heur_at >= 0 && (R.nodes > heur_at || now() > heur_time)) {
-        heur_at = -1;
-        if (H.thr() == INF) {
-          bool ok = feasibility_pump(0.1);
-          if (ok && H.thr() == INF) ok = dive_for_incumbent(1 << 30, 0.2);
-          if (!ok) {
-            drop_all();
-            return STOPPED;
-          }
-          if (!exact && H.thr() == INF) {
-            drop_all();
-            return NO_INCUMBENT;
-          }
-        }
-      }
-      double thr = H.thr();
-      if (!exact && thr < INF) {  // with an incumbent the exact search (reduced cost fixing, cuts, bounds) is the better tree
-        drop_all();
-        return SWITCH;
-      }
-      global_fix(thr);
-      std::pop_heap(open.begin(), open.end(), NodeCmp());
-      std::unique_ptr<Node> top(open.back());
-      open.pop_back();
-      if (exact && top->bound > -INF && !incomplete) H.offer_lb(std::min(round_up(top->bound), ub_of(thr)));
-      if (round_up(top->bound) > thr) {  // best-first: every other open node is at least as bad
-        drop_all();
-        break;
-      }
-      Node cur = std::move(*top);
-      bool from_queue = true;
-      for (;;) {  // plunge
-        if (stop()) {
-          undo_local();
-          drop_all();
-          return STOPPED;
-        }
-        if (H.keep && exact) {
-          double gb = cur.bound > -INF ? cur.bound : zr0;
-          if (!open.empty()) gb = std::min(gb, open.front()->bound > -INF ? open.front()->bound : zr0);
-          if (!H.keep(gb, R.nodes)) {
-            undo_local();
-            drop_all();
-            R.gave_up = true;
-            return STOPPED;
-          }
-        }
-        if (H.yield) {
-          H.yield();
-          thr = H.thr();
-          global_fix(thr);
-        }
-        switch_to(cur.fix);
-        if (from_queue && cur.basis) lp->set_basis(*cur.basis);
-        from_queue = false;
-        cur.basis.reset();
-        const LpSolver::Status st = lp->solve(thr == INF ? INF : thr + P.offset + 1e-9 * std::max(1.0, std::fabs(thr)));
-        ++R.nodes;
-        if (st == LpSolver::INFEASIBLE || st == LpSolver::CUTOFF) break;
-        if (st != LpSolver::OPTIMAL) {
-          if (stop()) {
-            undo_local();
-            drop_all();
-            return STOPPED;
-          }
-          incomplete = true;
-          break;
-        }
-        const double z = lp->obj() - P.offset;
-        if (cur.bvar >= 0) {  // pseudocost of the branching that led here
-          pcs[cur.bdir][cur.bvar] += std::max(z - cur.pz, 0.0) / std::max(cur.bfrac, 1e-9);
-          ++pcn[cur.bdir][cur.bvar];
-          cur.bvar = -1;
-        }
-        thr = H.thr();
-        if (round_up(z) > thr) break;
-        lp->get_x(x);
-        if (H.lp_point && (R.nodes & 15) == 1) H.lp_point(cols, x);
-        if (o.node_fixing && exact && thr < INF) local_fix(z, thr);
-        if (o.rins && exact && thr < INF && R.nodes >= rins_at && R.rins_time < 0.08 * now() + 0.01 * o.time_limit) {
-          const long found0 = R.rins_found;
-          rins();
-          // the next call waits four times as long, eight times after a call that found nothing
-          rins_at = std::max<long>(20, R.nodes * (R.rins_found > found0 ? 4 : 8));
-          thr = H.thr();
-          if (round_up(z) > thr) break;
-        }
-        cand.clear();
-        for (int k = 0; k < nk; ++k)
-          if (x[k] > FRAC && x[k] < 1.0 - FRAC) cand.push_back(k);
-        if (cand.empty()) {
-          offer_integral();
-          break;
-        }
-        if (nonneg && (cur.depth == 0 || R.nodes % 10 == 0)) {
-          round_greedy();
-          thr = H.thr();
-          if (round_up(z) > thr) break;
-        }
-        if (partition && branch_pair(cur, z, cand)) continue;
-        const int r = branch_var(cur, z, thr, cand);
-        if (r == -2) break;  // both children are infeasible or cut off
-      }
-      undo_local();
+    heur_at = H.thr() == INF ? total_nodes.load(std::memory_order_relaxed) + 3000 : -1;
+    heur_time = now() + 0.1 * o.time_limit;
+
+    // Activate cooperative helpers (external BnbTeam and/or internal threads).
+    if (H.team) {
+      H.team->activate([this](const std::function<bool()>& stay) { run_helper(stay); });
     }
-    return incomplete ? INCOMPLETE : EXHAUSTED;
+    std::vector<std::thread> internal_pool;
+    for (int t = 1; t < o.threads; ++t) {
+      internal_pool.emplace_back([this]() { run_helper(nullptr); });
+    }
+
+    worker_loop(main_w, nullptr);
+
+    // Signal all helpers to exit and wait until every helper has finished before destroying Search.
+    abort_lp.store(true, std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> lk(tree_mu);
+      terminated.store(true, std::memory_order_release);
+      tree_cv.notify_all();
+    }
+    for (auto& th : internal_pool) th.join();
+    if (H.team) H.team->deactivate();
+
+    finish_worker(main_w);
+    if (gave_up_flag.load(std::memory_order_relaxed)) R.gave_up = true;
+    R.lp_iters += rins_lp_iters;
+    R.nodes = total_nodes.load(std::memory_order_relaxed);
+    return exit_code;
   }
 
  private:
@@ -233,83 +189,958 @@ class Search {
   const double zroot;
   std::vector<int> cols;
   const bool exact;
+  const double time_left;
   BnbResult& R;
-  std::unique_ptr<LpSolver> lp;
+
+  std::unique_ptr<LpSolver> lp0;
+  std::unique_ptr<LpSolver> template_lp;
+  std::mutex clone_mu;
   int nk = 0;
-  std::vector<int> fv, curfix, want;
-  std::vector<char> gfix, rmark, lfix;
-  std::vector<int> lfixed;  // columns fixed by reduced cost for the current plunge only
-  std::vector<double> dnode;
-  long rins_at = 0;         // node count at which RINS runs next
   std::vector<double> dk;   // reduced costs of the loaded columns at the root (after the cut rounds, if any)
   double zr0 = 0.0;         // ... and the root LP value they belong to
-  std::vector<double> x, act, pcs[2], pairw;
-  std::vector<int> pcn[2];
-  std::vector<int> order, chosen, touched_pairs;
-  double last_thr = INF;
-  long sb_iters = 0;
   bool nonneg = true, partition = false, pure_sp = false;
-
-  std::vector<Node*> open;  // heap, best bound first
-
-  void push(Node* nd) {
-    open.push_back(nd);
-    std::push_heap(open.begin(), open.end(), NodeCmp());
-  }
 
   const Clock::time_point t_start = Clock::now();
   double now() const { return std::chrono::duration<double>(Clock::now() - t_start).count(); }
 
-  bool stop() const { return H.stop() || (o.node_limit >= 0 && R.nodes >= o.node_limit); }
+  std::atomic<bool> abort_lp{false};
+  std::atomic<bool> terminated{false};
+  std::atomic<bool> gave_up_flag{false};
+  std::atomic<long> total_nodes{0};
+  std::atomic<size_t> open_size{0};
+  std::atomic<double> cached_gb{-INF};
+  std::atomic<bool> rins_busy{false};
+  std::atomic<long> rins_at{0};
+  std::mutex rins_mu;
+  double rins_time_acc = 0.0;
+  long rins_lp_iters = 0;
+
+  long heur_at = -1;
+  double heur_time = 0.0;
+
+  // Protected by tree_mu
+  std::mutex tree_mu;
+  std::condition_variable tree_cv;
+  std::vector<Node*> open;  // heap, best bound first
+  std::vector<double> active_bound;
+  std::vector<int> free_slots;
+  int active_workers = 0;
+  bool incomplete = false;
+  int exit_code = EXHAUSTED;
+  double last_offered_lb = -INF;
+
+  // Pseudocosts protected by pc_mu
+  std::mutex pc_mu;
+  std::vector<double> pcs[2];
+  std::vector<int> pcn[2];
+  double pc_avg_sum[2] = {0.0, 0.0};
+  long pc_nonzero[2] = {0, 0};
+
+  // Keep hook guarded by keep_mu
+  std::mutex keep_mu;
+
+  struct Worker {
+    Search& S;
+    int wid;
+    std::unique_ptr<LpSolver> lp;
+    std::vector<int> fv, curfix, want, lfixed;
+    std::vector<char> gfix, lfix, rmark;
+    std::vector<double> x, dnode, act, pairw;
+    std::vector<int> order, chosen, touched_pairs;
+    double last_thr = INF;
+    long sb_iters = 0, local_strong = 0, local_fixed = 0;
+
+    Worker(Search& S_, int wid_, std::unique_ptr<LpSolver> lp_)
+        : S(S_), wid(wid_), lp(std::move(lp_)), fv(S_.nk, -1), want(S_.nk, 0), gfix(S_.nk, 0), lfix(S_.nk, 0),
+          act(S_.P.m, 0.0) {
+      if (S.partition) {
+        rmark.assign(S.P.m, 0);
+        pairw.assign(static_cast<size_t>(S.P.m) * S.P.m, 0.0);
+      }
+    }
+
+    void global_fix(double thr) {
+      if (!(thr < last_thr)) return;
+      last_thr = thr;
+      for (int k = 0; k < S.nk; ++k) {
+        if (gfix[k]) continue;
+        const double dj = S.dk[k];
+        if (dj > 0.0 && S.round_up(S.zr0 + dj - 1e-9 * std::max(1.0, std::fabs(S.zr0))) > thr) {
+          gfix[k] = 1;
+          if (fv[k] == -1) lp->set_col_bounds(k, 0.0, 0.0);
+        }
+      }
+    }
+
+    void local_fix(double z, double thr) {
+      lp->get_red_cost(dnode);
+      const double eps = 1e-7 * std::max(1.0, std::fabs(z));
+      for (int k = 0; k < S.nk; ++k) {
+        if (fv[k] != -1 || gfix[k] || lfix[k]) continue;
+        const double dk_val = dnode[k];
+        if (x[k] < 1e-9 && dk_val > 0.0 && S.round_up(z + dk_val - eps) > thr) {
+          lfix[k] = 1;
+          lfixed.push_back(k);
+          lp->set_col_bounds(k, 0.0, 0.0);
+          ++local_fixed;
+        } else if (x[k] > 1.0 - 1e-9 && dk_val < 0.0 && S.round_up(z - dk_val - eps) > thr) {
+          lfix[k] = 2;
+          lfixed.push_back(k);
+          lp->set_col_bounds(k, 1.0, 1.0);
+          ++local_fixed;
+        }
+      }
+    }
+
+    void undo_local() {
+      for (int k : lfixed) {
+        lfix[k] = 0;
+        if (fv[k] == -1) lp->set_col_bounds(k, 0.0, gfix[k] ? 0.0 : 1.0);
+      }
+      lfixed.clear();
+    }
+
+    void switch_to(const std::vector<int>& fix) {
+      for (int e : fix) want[e >> 1] = (e & 1) + 1;
+      for (int e : curfix) {
+        const int k = e >> 1;
+        if (want[k] - 1 != fv[k]) {
+          fv[k] = -1;
+          if (lfix[k]) lp->set_col_bounds(k, lfix[k] - 1.0, lfix[k] - 1.0);
+          else lp->set_col_bounds(k, 0.0, gfix[k] ? 0.0 : 1.0);
+        }
+      }
+      for (int e : fix) {
+        const int k = e >> 1, v = e & 1;
+        if (fv[k] != v) {
+          fv[k] = v;
+          lp->set_col_bounds(k, v, v);
+        }
+        want[k] = 0;
+      }
+      curfix = fix;
+    }
+
+    void offer_integral() {
+      std::vector<int> sol;
+      double cost = 0.0;
+      for (int k = 0; k < S.nk; ++k)
+        if (x[k] > 0.5) {
+          sol.push_back(S.cols[k]);
+          cost += S.P.cost[S.cols[k]];
+        }
+      std::sort(sol.begin(), sol.end());
+      S.H.offer(sol, cost);
+    }
+
+    std::shared_ptr<const std::vector<char>> node_basis() const {
+      const size_t osz = S.open_size.load(std::memory_order_relaxed);
+      if (!S.o.node_basis || static_cast<double>(osz + 1) * (S.P.m + S.nk) > 4e8) return nullptr;
+      return std::make_shared<const std::vector<char>>(lp->get_basis());
+    }
+
+    void round_greedy() {
+      order.clear();
+      for (int k = 0; k < S.nk; ++k)
+        if (x[k] > FRAC) order.push_back(k);
+      std::sort(order.begin(), order.end(), [&](int a, int b) {
+        if (x[a] != x[b]) return x[a] > x[b];
+        if (S.P.cost[S.cols[a]] != S.P.cost[S.cols[b]]) return S.P.cost[S.cols[a]] < S.P.cost[S.cols[b]];
+        return a < b;
+      });
+      std::fill(act.begin(), act.end(), 0.0);
+      chosen.clear();
+      for (int k : order) {
+        const int j = S.cols[k];
+        bool helps = false, fits = true;
+        for (int q = S.P.cptr[j]; q < S.P.cptr[j + 1] && fits; ++q) {
+          const int i = S.P.cidx[q];
+          if (act[i] < S.P.rlo[i] - 1e-9) helps = true;
+          if (act[i] + S.P.cval[q] > S.P.rup[i] + 1e-9) fits = false;
+        }
+        if (!helps || !fits) continue;
+        chosen.push_back(j);
+        for (int q = S.P.cptr[j]; q < S.P.cptr[j + 1]; ++q) act[S.P.cidx[q]] += S.P.cval[q];
+      }
+      for (int i = 0; i < S.P.m; ++i)
+        if (act[i] < S.P.rlo[i] - 1e-9) return;
+      std::sort(chosen.begin(), chosen.end(),
+                [&](int a, int b) { return S.P.cost[a] > S.P.cost[b] || (S.P.cost[a] == S.P.cost[b] && a < b); });
+      std::vector<int> sol;
+      double cost = 0.0;
+      for (int j : chosen) {
+        bool redundant = true;
+        for (int q = S.P.cptr[j]; q < S.P.cptr[j + 1] && redundant; ++q)
+          if (act[S.P.cidx[q]] - S.P.cval[q] < S.P.rlo[S.P.cidx[q]] - 1e-9) redundant = false;
+        if (redundant) {
+          for (int q = S.P.cptr[j]; q < S.P.cptr[j + 1]; ++q) act[S.P.cidx[q]] -= S.P.cval[q];
+        } else {
+          sol.push_back(j);
+          cost += S.P.cost[j];
+        }
+      }
+      if (cost <= S.H.thr()) {
+        std::sort(sol.begin(), sol.end());
+        S.H.offer(sol, cost);
+      }
+    }
+
+    void rins() {
+      if (!S.H.incumbent) return;
+      const double t_begin = S.now(), thr0 = S.H.thr();
+      std::vector<int> inc, ones, freec;
+      S.H.incumbent(inc);
+      if (inc.empty()) return;
+      std::vector<char> is_inc(S.P.n, 0);
+      for (int j : inc) is_inc[j] = 1;
+      for (int k = 0; k < S.nk; ++k) {
+        const int j = S.cols[k];
+        if (is_inc[j] && x[k] > 1.0 - 1e-6) ones.push_back(j);
+        else if (is_inc[j] || x[k] > 1e-6) freec.push_back(j);
+        is_inc[j] = 0;
+      }
+      for (int j : inc)
+        if (is_inc[j]) freec.push_back(j);
+      std::sort(freec.begin(), freec.end());
+      const SubProblem sub = make_sub(S.P, freec, ones, S.nonneg);
+      if (!sub.ok || sub.P.n < 3) return;
+      const double budget = std::max(0.05, 0.02 * S.o.time_limit), t_end = t_begin + budget;
+      BnbHooks h;
+      h.thr = [&]() { return S.H.thr() - sub.fixed_cost; };
+      h.offer = [&](const std::vector<int>& sc, double c) {
+        std::vector<int> full = ones;
+        for (int k : sc) full.push_back(sub.col_of[k]);
+        std::sort(full.begin(), full.end());
+        S.H.offer(full, c + sub.fixed_cost);
+      };
+      h.offer_lb = [](double) {};
+      h.stop = [&]() { return S.terminated.load(std::memory_order_relaxed) || S.stop() || S.now() >= t_end; };
+      BnbOptions so = S.o;
+      so.rins = false;
+      so.threads = 1;
+      long rcalls;
+      {
+        std::lock_guard<std::mutex> lk(S.rins_mu);
+        rcalls = S.R.rins_calls;
+      }
+      so.seed = S.o.seed + static_cast<unsigned>(rcalls) * 7919u + 1u;
+      so.node_limit = 100;
+      so.time_limit = budget;
+      so.cut_rounds = std::min(S.o.cut_rounds, 10);
+      const BnbResult r = branch_and_bound(sub.P, h, so);
+      const bool improved = S.H.thr() < thr0;
+      {
+        std::lock_guard<std::mutex> lk(S.rins_mu);
+        S.rins_lp_iters += r.lp_iters;
+        ++S.R.rins_calls;
+        if (improved) ++S.R.rins_found;
+        S.rins_time_acc += S.now() - t_begin;
+        S.R.rins_time = S.rins_time_acc;
+      }
+      const long nn = S.total_nodes.load(std::memory_order_relaxed);
+      S.rins_at.store(std::max<long>(20, nn * (improved ? 4 : 8)), std::memory_order_relaxed);
+    }
+
+    // Exact cover search for pure partitioning problems, without LPs (called on worker 0 only).
+    bool cover_search(double time_frac) {
+      const int m = S.P.m;
+      std::vector<int> rptr(m + 1, 0), rcol;
+      for (int k = 0; k < S.nk; ++k)
+        if (!gfix[k])
+          for (int q = S.P.cptr[S.cols[k]]; q < S.P.cptr[S.cols[k] + 1]; ++q) ++rptr[S.P.cidx[q] + 1];
+      for (int i = 0; i < m; ++i) rptr[i + 1] += rptr[i];
+      rcol.resize(rptr[m]);
+      {
+        std::vector<int> pos(rptr.begin(), rptr.end() - 1);
+        for (int k = 0; k < S.nk; ++k)
+          if (!gfix[k])
+            for (int q = S.P.cptr[S.cols[k]]; q < S.P.cptr[S.cols[k] + 1]; ++q) rcol[pos[S.P.cidx[q]]++] = k;
+      }
+      std::vector<double> key(S.nk);
+      std::vector<int> ban(S.nk, 0), avail(m), chosen_k;
+      std::vector<char> cov(m, 0);
+      std::mt19937 rng(S.o.seed * 69069u + 4242u);
+      std::uniform_real_distribution<double> uni(0.0, 1.0);
+      double dmax = 1e-12;
+      for (int k = 0; k < S.nk; ++k) dmax = std::max(dmax, std::fabs(S.droot[S.cols[k]]));
+      const double t0 = S.now();
+      long limit = 2000;
+      bool found = false;
+      struct Frame {
+        int row, next;
+        std::vector<int> cands;
+      };
+      for (int round = 0; !found; ++round, limit *= 2) {
+        const double noise = round == 0 ? 0.0 : 0.3;
+        for (int k = 0; k < S.nk; ++k) key[k] = S.droot[S.cols[k]] / dmax + noise * uni(rng);
+        std::fill(ban.begin(), ban.end(), 0);
+        std::fill(cov.begin(), cov.end(), 0);
+        for (int i = 0; i < m; ++i) avail[i] = rptr[i + 1] - rptr[i];
+        chosen_k.clear();
+        std::vector<Frame> stack;
+        long nodes = 0;
+        int ncov = 0;
+        auto choose = [&](int k) {
+          const int j = S.cols[k];
+          for (int q = S.P.cptr[j]; q < S.P.cptr[j + 1]; ++q) {
+            const int r = S.P.cidx[q];
+            cov[r] = 1;
+            ++ncov;
+            for (int a = rptr[r]; a < rptr[r + 1]; ++a) {
+              const int k2 = rcol[a];
+              if (ban[k2]++ == 0)
+                for (int b = S.P.cptr[S.cols[k2]]; b < S.P.cptr[S.cols[k2] + 1]; ++b) --avail[S.P.cidx[b]];
+            }
+          }
+          chosen_k.push_back(k);
+        };
+        auto unchoose = [&]() {
+          const int k = chosen_k.back();
+          chosen_k.pop_back();
+          const int j = S.cols[k];
+          for (int q = S.P.cptr[j]; q < S.P.cptr[j + 1]; ++q) {
+            const int r = S.P.cidx[q];
+            cov[r] = 0;
+            --ncov;
+            for (int a = rptr[r]; a < rptr[r + 1]; ++a) {
+              const int k2 = rcol[a];
+              if (--ban[k2] == 0)
+                for (int b = S.P.cptr[S.cols[k2]]; b < S.P.cptr[S.cols[k2] + 1]; ++b) ++avail[S.P.cidx[b]];
+            }
+          }
+        };
+        auto open_row = [&]() {
+          int best = -1;
+          for (int i = 0; i < m; ++i)
+            if (!cov[i] && (best < 0 || avail[i] < avail[best])) best = i;
+          if (best < 0 || avail[best] == 0) return false;
+          Frame f;
+          f.row = best;
+          f.next = 0;
+          for (int a = rptr[best]; a < rptr[best + 1]; ++a)
+            if (ban[rcol[a]] == 0) f.cands.push_back(rcol[a]);
+          std::sort(f.cands.begin(), f.cands.end(),
+                    [&](int a, int b) { return key[a] < key[b] || (key[a] == key[b] && a < b); });
+          stack.push_back(std::move(f));
+          return true;
+        };
+        bool exhausted = false;
+        if (!open_row()) exhausted = true;
+        while (!exhausted && !found) {
+          if ((nodes & 255) == 0 && (S.stop() || S.now() - t0 > time_frac * S.o.time_limit)) return !S.stop();
+          if (nodes > limit) break;
+          Frame& f = stack.back();
+          if (f.next > 0) unchoose();
+          if (f.next >= static_cast<int>(f.cands.size())) {
+            stack.pop_back();
+            if (stack.empty()) exhausted = true;
+            continue;
+          }
+          choose(f.cands[f.next++]);
+          ++nodes;
+          ++S.R.cover_nodes;
+          if (ncov == m) {
+            found = true;
+            break;
+          }
+          if (!open_row()) continue;
+        }
+        if (found) {
+          std::vector<int> sol;
+          double cost = 0.0;
+          for (int k : chosen_k) {
+            sol.push_back(S.cols[k]);
+            cost += S.P.cost[S.cols[k]];
+          }
+          std::sort(sol.begin(), sol.end());
+          S.H.offer(sol, cost);
+        }
+        if (exhausted) break;
+      }
+      return true;
+    }
+
+    // Feasibility pump (called on worker 0 only).
+    bool feasibility_pump(double time_frac) {
+      switch_to({});
+      if (lp->solve() != LpSolver::OPTIMAL) return !S.stop();
+      ++S.total_nodes;
+      lp->get_x(x);
+      std::mt19937 rng(S.o.seed * 40503u + 977u);
+      std::vector<char> xt(S.nk), prev1, prev2;
+      for (int k = 0; k < S.nk; ++k) xt[k] = x[k] > 0.5;
+      double cmax = 0.0;
+      for (double c : S.P.cost) cmax = std::max(cmax, std::fabs(c));
+      if (cmax == 0.0) cmax = 1.0;
+      const double t0 = S.now();
+      const double budget = time_frac * S.o.time_limit;
+      std::vector<std::pair<double, int>> sc;
+      bool ok = true, found = false;
+      for (int it = 0; it < 300 && !found; ++it) {
+        if (S.stop()) {
+          ok = false;
+          break;
+        }
+        if (S.now() - t0 > budget || S.H.thr() < INF) break;
+        for (int k = 0; k < S.nk; ++k) lp->set_col_cost(k, xt[k] ? -cmax : cmax);
+        if (lp->solve() != LpSolver::OPTIMAL) break;
+        ++S.R.pump_iters;
+        lp->get_x(x);
+        bool integral_point = true, same = true;
+        for (int k = 0; k < S.nk; ++k) {
+          if (x[k] > FRAC && x[k] < 1.0 - FRAC) integral_point = false;
+          if ((x[k] > 0.5) != (xt[k] != 0)) same = false;
+        }
+        if (integral_point) {
+          found = true;
+          break;
+        }
+        if (!same) {
+          prev2 = prev1;
+          prev1 = xt;
+          for (int k = 0; k < S.nk; ++k) xt[k] = x[k] > 0.5;
+          if (xt != prev2) continue;
+        }
+        sc.clear();
+        for (int k = 0; k < S.nk; ++k) {
+          const double dist = std::fabs(x[k] - (xt[k] ? 1.0 : 0.0));
+          if (dist > 1e-9) sc.push_back({-dist, k});
+        }
+        std::sort(sc.begin(), sc.end());
+        const size_t flips = std::min<size_t>(sc.size(), 10 + rng() % 20);
+        for (size_t q = 0; q < flips; ++q) xt[sc[q].second] ^= 1;
+        if (sc.empty() || it % 30 == 29)
+          for (int k = 0; k < S.nk; ++k)
+            if (x[k] > FRAC && rng() % 4 == 0) xt[k] ^= 1;
+      }
+      for (int k = 0; k < S.nk; ++k) lp->set_col_cost(k, S.P.cost[S.cols[k]]);
+      if (found) {
+        offer_integral();
+        ++S.R.pump_found;
+      }
+      return ok;
+    }
+
+    // Restarted randomized diving while there is no incumbent (called on worker 0 only).
+    bool dive_for_incumbent(int max_dives, double time_frac) {
+      std::mt19937 rng(S.o.seed * 2654435761u + 12345u);
+      std::vector<int> fix, cand;
+      const double t0 = S.now();
+      const double budget = time_frac * S.o.time_limit;
+      for (int dive = 0; dive < max_dives && S.H.thr() == INF; ++dive) {
+        fix.clear();
+        int flips = 0;
+        const int max_flips = 10 + 5 * std::min(dive, 40);
+        for (;;) {
+          if (S.stop()) return false;
+          if (S.now() - t0 > budget) {
+            switch_to({});
+            return true;
+          }
+          switch_to(fix);
+          const LpSolver::Status st = lp->solve();
+          ++S.total_nodes;
+          ++S.R.dive_nodes;
+          if (st != LpSolver::OPTIMAL) {
+            if (st != LpSolver::INFEASIBLE && S.stop()) return false;
+            while (!fix.empty() && (fix.back() & 1) == 0) fix.pop_back();
+            if (fix.empty()) {
+              if (dive == 0 && flips == 0) {
+                switch_to({});
+                return true;
+              }
+              break;
+            }
+            if (++flips > max_flips) break;
+            fix.back() -= 1;
+            continue;
+          }
+          lp->get_x(x);
+          cand.clear();
+          for (int k = 0; k < S.nk; ++k)
+            if (x[k] > FRAC && x[k] < 1.0 - FRAC) cand.push_back(k);
+          if (cand.empty()) {
+            offer_integral();
+            break;
+          }
+          if (S.nonneg && fix.empty()) round_greedy();
+          std::partial_sort(cand.begin(), cand.begin() + std::min<size_t>(3, cand.size()), cand.end(),
+                            [&](int a, int b) { return x[a] > x[b] || (x[a] == x[b] && a < b); });
+          const unsigned r = dive == 0 ? 0 : rng() % 6;
+          const size_t pick = std::min<size_t>(r < 3 ? 0 : (r < 5 ? 1 : 2), cand.size() - 1);
+          fix.push_back(cand[pick] * 2 + 1);
+        }
+        ++S.R.dives;
+      }
+      switch_to({});
+      return true;
+    }
+
+    bool branch_pair(Node& cur, double z, const std::vector<int>& cand) {
+      const size_t m = static_cast<size_t>(S.P.m);
+      touched_pairs.clear();
+      for (int k : cand) {
+        const int j = S.cols[k];
+        for (int a = S.P.cptr[j]; a < S.P.cptr[j + 1]; ++a)
+          for (int b = a + 1; b < S.P.cptr[j + 1]; ++b) {
+            const size_t id = static_cast<size_t>(S.P.cidx[a]) * m + S.P.cidx[b];
+            if (pairw[id] == 0.0) touched_pairs.push_back(static_cast<int>(id));
+            pairw[id] += x[k];
+          }
+      }
+      int best = -1;
+      double bd = 0.5 - 1e-6;
+      for (int id : touched_pairs) {
+        const double d = std::fabs(pairw[id] - 0.5);
+        if (d < bd || (d == bd && id < best)) bd = d, best = id;
+      }
+      for (int id : touched_pairs) pairw[id] = 0.0;
+      if (best < 0) return false;
+      const int r = best / S.P.m, s = best % S.P.m;
+      rmark[r] = rmark[s] = 1;
+      const double zb = std::max(z, cur.bound);
+      Node* differ = new Node();
+      differ->basis = node_basis();
+      differ->bound = zb;
+      differ->depth = cur.depth + 1;
+      differ->fix = cur.fix;
+      for (int k = 0; k < S.nk; ++k) {
+        if (fv[k] != -1 || gfix[k]) continue;
+        const int j = S.cols[k];
+        int hit = 0;
+        for (int q = S.P.cptr[j]; q < S.P.cptr[j + 1]; ++q) hit += rmark[S.P.cidx[q]];
+        if (hit == 1) cur.fix.push_back(k * 2);
+        else if (hit == 2) differ->fix.push_back(k * 2);
+      }
+      rmark[r] = rmark[s] = 0;
+      S.push_sibling_and_raise(wid, differ, zb);
+      cur.bound = zb;
+      ++cur.depth;
+      return true;
+    }
+
+    int branch_var(Node& cur, double z, double thr, std::vector<int>& cand) {
+      std::sort(cand.begin(), cand.end(), [&](int a, int b) {
+        const double fa = std::fabs(x[a] - 0.5), fb = std::fabs(x[b] - 0.5);
+        return fa < fb || (fa == fb && a < b);
+      });
+      struct CandPc {
+        double s0, s1;
+        int c0, c1;
+      };
+      std::vector<CandPc> cpc(cand.size());
+      double avg[2] = {1.0, 1.0};
+      {
+        std::lock_guard<std::mutex> lk(S.pc_mu);
+        for (int d = 0; d < 2; ++d)
+          if (S.pc_nonzero[d] > 0) avg[d] = S.pc_avg_sum[d] / static_cast<double>(S.pc_nonzero[d]);
+        for (size_t i = 0; i < cand.size(); ++i) {
+          const int k = cand[i];
+          cpc[i] = {S.pcs[0][k], S.pcs[1][k], S.pcn[0][k], S.pcn[1][k]};
+        }
+      }
+      const bool may_strong = S.o.strong_cands > 0 &&
+                              (cur.depth <= 8 || sb_iters < S.o.strong_share * static_cast<double>(lp->iterations()));
+      const double cut = thr == INF ? INF : thr + S.P.offset + 1e-9 * std::max(1.0, std::fabs(thr));
+      LpSolver::State node_state;
+      bool saved = false;
+      int best = -1, tried = 0, since_best = 0;
+      double best_score = -1.0;
+      const std::vector<double> x0 = x;
+      struct PcObs {
+        int k;
+        double v0, v1;
+      };
+      std::vector<PcObs> obs;
+      for (size_t ci = 0; ci < cand.size(); ++ci) {
+        const int k = cand[ci];
+        const double f = x0[k];
+        double d0, d1;
+        const bool unreliable = cpc[ci].c0 < S.o.reliability || cpc[ci].c1 < S.o.reliability;
+        if (may_strong && unreliable && tried < S.o.strong_cands && since_best < S.o.strong_lookahead) {
+          ++tried;
+          ++since_best;
+          if (!saved) {
+            lp->save_state(node_state);
+            saved = true;
+          }
+          double zc[2];
+          for (int v = 0; v < 2; ++v) {
+            const long it0 = lp->iterations();
+            lp->set_col_bounds(k, v, v);
+            const LpSolver::Status st = lp->solve(cut, S.o.strong_iters);
+            ++local_strong;
+            zc[v] = (st == LpSolver::INFEASIBLE || st == LpSolver::CUTOFF) ? INF
+                    : (st == LpSolver::OPTIMAL || st == LpSolver::LIMIT) ? std::max(lp->obj() - S.P.offset, z) : z;
+            if (zc[v] < INF && S.round_up(zc[v]) > thr) zc[v] = INF;
+            sb_iters += lp->iterations() - it0;
+            lp->set_col_bounds(k, 0.0, 1.0);
+            lp->restore_state(node_state);
+          }
+          if (zc[0] == INF && zc[1] == INF) {
+            if (!obs.empty()) S.record_pcs(obs);
+            return -2;
+          }
+          if (zc[0] == INF || zc[1] == INF) {
+            if (!obs.empty()) S.record_pcs(obs);
+            cur.fix.push_back(k * 2 + (zc[0] == INF ? 1 : 0));
+            return -1;
+          }
+          d0 = zc[0] - z;
+          d1 = zc[1] - z;
+          obs.push_back({k, d0 / std::max(f, 1e-9), d1 / std::max(1.0 - f, 1e-9)});
+        } else {
+          d0 = (cpc[ci].c0 ? cpc[ci].s0 / cpc[ci].c0 : avg[0]) * f;
+          d1 = (cpc[ci].c1 ? cpc[ci].s1 / cpc[ci].c1 : avg[1]) * (1.0 - f);
+        }
+        const double score = std::max(d0, 1e-6) * std::max(d1, 1e-6);
+        if (score > best_score) best_score = score, best = k, since_best = 0;
+      }
+      if (!obs.empty()) S.record_pcs(obs);
+      const double zb = std::max(z, cur.bound);
+      Node* down = new Node();
+      down->basis = node_basis();
+      down->bound = zb;
+      down->depth = cur.depth + 1;
+      down->fix = cur.fix;
+      down->fix.push_back(best * 2);
+      down->bvar = best;
+      down->bdir = 0;
+      down->bfrac = x0[best];
+      down->pz = z;
+      S.push_sibling_and_raise(wid, down, zb);
+      cur.fix.push_back(best * 2 + 1);
+      cur.bound = zb;
+      ++cur.depth;
+      cur.bvar = best;
+      cur.bdir = 1;
+      cur.bfrac = 1.0 - x0[best];
+      cur.pz = z;
+      return best;
+    }
+  };
+
+  bool stop() const {
+    return H.stop() || (o.node_limit >= 0 && total_nodes.load(std::memory_order_relaxed) >= o.node_limit);
+  }
   double round_up(double z) const { return o.integral ? std::ceil(z - 1e-6) : z; }
-  double ub_of(double thr) const {  // the incumbent value behind thr
+  double ub_of(double thr) const {
     if (thr == INF) return INF;
     return o.integral ? thr + 1.0 - 1e-6 : thr;
   }
 
-  // RINS with the LP solution x of the node just solved: the incumbent's columns that are at one in x
-  // stay at one, the other columns of the incumbent and of the support of x are free, the rest is zero.
-  void rins() {
-    if (!H.incumbent) return;
-    const double t_begin = now(), thr0 = H.thr();
-    std::vector<int> inc, ones, freec;
-    H.incumbent(inc);
-    if (inc.empty()) return;
-    std::vector<char> is_inc(P.n, 0);
-    for (int j : inc) is_inc[j] = 1;
-    for (int k = 0; k < nk; ++k) {
-      const int j = cols[k];
-      if (is_inc[j] && x[k] > 1.0 - 1e-6) ones.push_back(j);
-      else if (is_inc[j] || x[k] > 1e-6) freec.push_back(j);
-      is_inc[j] = 0;
+  double rins_time_sec() {
+    std::lock_guard<std::mutex> lk(rins_mu);
+    return rins_time_acc;
+  }
+
+  bool check_keep(double gb) {
+    std::lock_guard<std::mutex> lk(keep_mu);
+    return H.keep(gb, total_nodes.load(std::memory_order_relaxed));
+  }
+
+  void add_pc_locked(int d, int k, double val) {
+    if (pcn[d][k] > 0) pc_avg_sum[d] -= pcs[d][k] / static_cast<double>(pcn[d][k]);
+    else ++pc_nonzero[d];
+    pcs[d][k] += val;
+    ++pcn[d][k];
+    pc_avg_sum[d] += pcs[d][k] / static_cast<double>(pcn[d][k]);
+  }
+
+  void record_pc(int d, int k, double val) {
+    std::lock_guard<std::mutex> lk(pc_mu);
+    add_pc_locked(d, k, val);
+  }
+
+  template <class ObsVec>
+  void record_pcs(const ObsVec& obs) {
+    std::lock_guard<std::mutex> lk(pc_mu);
+    for (const auto& u : obs) {
+      add_pc_locked(0, u.k, u.v0);
+      add_pc_locked(1, u.k, u.v1);
     }
-    for (int j : inc)
-      if (is_inc[j]) freec.push_back(j);  // a column of the incumbent that is not loaded
-    std::sort(freec.begin(), freec.end());
-    const SubProblem sub = make_sub(P, freec, ones, nonneg);
-    if (!sub.ok || sub.P.n < 3) return;
-    const double budget = std::max(0.05, 0.02 * o.time_limit), t_end = t_begin + budget;
-    BnbHooks h;
-    h.thr = [&]() { return H.thr() - sub.fixed_cost; };
-    h.offer = [&](const std::vector<int>& sc, double c) {
-      std::vector<int> full = ones;
-      for (int k : sc) full.push_back(sub.col_of[k]);
-      std::sort(full.begin(), full.end());
-      H.offer(full, c + sub.fixed_cost);
-    };
-    h.offer_lb = [](double) {};
-    h.stop = [&]() { return stop() || now() >= t_end; };
-    BnbOptions so = o;
-    so.rins = false;
-    so.seed = o.seed + static_cast<unsigned>(R.rins_calls) * 7919u + 1u;
-    so.node_limit = 100;
-    so.time_limit = budget;
-    so.cut_rounds = std::min(o.cut_rounds, 10);
-    const BnbResult r = branch_and_bound(sub.P, h, so);
-    R.lp_iters += r.lp_iters;
-    ++R.rins_calls;
-    if (H.thr() < thr0) ++R.rins_found;
-    R.rins_time += now() - t_begin;
+  }
+
+  void push_locked(Node* nd) {
+    open.push_back(nd);
+    std::push_heap(open.begin(), open.end(), NodeCmp());
+    open_size.store(open.size(), std::memory_order_relaxed);
+  }
+
+  void drop_open_locked() {
+    for (Node* nd : open) delete nd;
+    open.clear();
+    open_size.store(0, std::memory_order_relaxed);
+  }
+
+  double global_bound_locked() const {
+    double gb = INF;
+    if (!open.empty()) gb = std::min(gb, open.front()->bound);
+    for (double b : active_bound)
+      if (b < gb) gb = b;
+    return gb;
+  }
+
+  void update_cached_gb_locked() {
+    const double gb = global_bound_locked();
+    if (gb < INF) cached_gb.store(gb > -INF ? gb : zr0, std::memory_order_relaxed);
+  }
+
+  void terminate_locked(int code) {
+    if (!terminated.load(std::memory_order_relaxed)) {
+      exit_code = code;
+      terminated.store(true, std::memory_order_release);
+      abort_lp.store(true, std::memory_order_release);
+      drop_open_locked();
+      tree_cv.notify_all();
+    }
+  }
+
+  void terminate(int code) {
+    std::lock_guard<std::mutex> lk(tree_mu);
+    terminate_locked(code);
+  }
+
+  void set_incomplete() {
+    std::lock_guard<std::mutex> lk(tree_mu);
+    incomplete = true;
+  }
+
+  void push_node(Node* nd) {
+    std::lock_guard<std::mutex> lk(tree_mu);
+    if (terminated.load(std::memory_order_relaxed)) {
+      delete nd;
+      return;
+    }
+    push_locked(nd);
+    update_cached_gb_locked();
+    tree_cv.notify_one();
+  }
+
+  void push_sibling_and_raise(int wid, Node* sibling, double new_bound) {
+    std::lock_guard<std::mutex> lk(tree_mu);
+    if (terminated.load(std::memory_order_relaxed)) {
+      delete sibling;
+      return;
+    }
+    push_locked(sibling);
+    if (new_bound > active_bound[wid]) active_bound[wid] = new_bound;
+    update_cached_gb_locked();
+    tree_cv.notify_one();
+  }
+
+  void finish_worker(Worker& W) {
+    std::lock_guard<std::mutex> lk(tree_mu);
+    R.lp_iters += W.lp->iterations();
+    R.strong_lps += W.local_strong;
+    R.node_fixed += W.local_fixed;
+    if (W.wid > 0) {
+      active_bound[W.wid] = INF;
+      free_slots.push_back(W.wid);
+    }
+  }
+
+  void run_helper(const std::function<bool()>& stay) {
+    if (terminated.load(std::memory_order_acquire) || stop()) return;
+    int wid;
+    {
+      std::lock_guard<std::mutex> lk(tree_mu);
+      if (terminated.load(std::memory_order_relaxed)) return;
+      if (!free_slots.empty()) {
+        wid = free_slots.back();
+        free_slots.pop_back();
+        active_bound[wid] = INF;
+      } else {
+        wid = static_cast<int>(active_bound.size());
+        active_bound.push_back(INF);
+      }
+    }
+    std::unique_ptr<LpSolver> wlp;
+    {
+      std::lock_guard<std::mutex> lk(clone_mu);
+      if (terminated.load(std::memory_order_relaxed) || !template_lp) {
+        std::lock_guard<std::mutex> lk2(tree_mu);
+        free_slots.push_back(wid);
+        return;
+      }
+      wlp = template_lp->clone(o.seed + 7919u * static_cast<unsigned>(wid), std::max(0.0, time_left - now()), &abort_lp);
+    }
+    Worker W(*this, wid, std::move(wlp));
+    worker_loop(W, stay);
+    finish_worker(W);
+  }
+
+  void worker_loop(Worker& W, const std::function<bool()>& stay) {
+    const bool is_main = W.wid == 0;
+    std::vector<int> cand;
+    for (;;) {
+      std::unique_ptr<Node> top;
+      double thr = INF;
+      double lb_to_offer = -INF;
+      {
+        std::unique_lock<std::mutex> lk(tree_mu);
+        for (;;) {
+          if (terminated.load(std::memory_order_relaxed)) return;
+          if (stop()) {
+            terminate_locked(STOPPED);
+            return;
+          }
+          if (!is_main && stay && !stay()) return;
+          thr = H.thr();
+          if (!exact && thr < INF) {
+            terminate_locked(SWITCH);
+            return;
+          }
+          if (!open.empty() && round_up(open.front()->bound) > thr) {
+            drop_open_locked();
+          }
+          if (open.empty()) {
+            if (active_workers == 0) {
+              terminate_locked(incomplete ? INCOMPLETE : EXHAUSTED);
+              return;
+            }
+            tree_cv.wait_for(lk, std::chrono::milliseconds(5));
+            continue;
+          }
+          if (is_main && heur_at >= 0 && (total_nodes.load(std::memory_order_relaxed) > heur_at || now() > heur_time)) {
+            heur_at = -1;
+            if (thr == INF) {
+              active_bound[0] = open.front()->bound;
+              ++active_workers;
+              lk.unlock();
+              bool ok = W.feasibility_pump(0.1);
+              if (ok && H.thr() == INF) ok = W.dive_for_incumbent(1 << 30, 0.2);
+              lk.lock();
+              --active_workers;
+              active_bound[0] = INF;
+              if (!ok) {
+                terminate_locked(STOPPED);
+                return;
+              }
+              if (!exact && H.thr() == INF) {
+                terminate_locked(NO_INCUMBENT);
+                return;
+              }
+              tree_cv.notify_all();
+              continue;
+            }
+          }
+          std::pop_heap(open.begin(), open.end(), NodeCmp());
+          top.reset(open.back());
+          open.pop_back();
+          open_size.store(open.size(), std::memory_order_relaxed);
+          active_bound[W.wid] = top->bound;
+          ++active_workers;
+          const double gb = global_bound_locked();
+          if (gb < INF) cached_gb.store(gb > -INF ? gb : zr0, std::memory_order_relaxed);
+          if (exact && !incomplete && gb > -INF && gb < INF) {
+            const double offer_b = std::min(round_up(gb), ub_of(thr));
+            if (offer_b > last_offered_lb) {
+              last_offered_lb = offer_b;
+              lb_to_offer = offer_b;
+            }
+          }
+          break;
+        }
+      }
+      if (lb_to_offer > -INF) H.offer_lb(lb_to_offer);
+      W.global_fix(thr);
+      Node cur = std::move(*top);
+      bool from_queue = true;
+      for (;;) {
+        if (terminated.load(std::memory_order_relaxed)) break;
+        if (stop()) {
+          terminate(STOPPED);
+          break;
+        }
+        if (!is_main && stay && !stay()) {
+          W.undo_local();
+          Node* ret = new Node(std::move(cur));
+          if (!from_queue) ret->basis = W.node_basis();
+          push_node(ret);
+          break;
+        }
+        if (H.keep && exact) {
+          const double gb = cached_gb.load(std::memory_order_relaxed);
+          if (!check_keep(gb)) {
+            gave_up_flag.store(true, std::memory_order_relaxed);
+            terminate(STOPPED);
+            break;
+          }
+        }
+        if (is_main && H.yield) {
+          H.yield();
+          thr = H.thr();
+          W.global_fix(thr);
+        }
+        W.switch_to(cur.fix);
+        if (from_queue && cur.basis) W.lp->set_basis(*cur.basis);
+        from_queue = false;
+        cur.basis.reset();
+        const LpSolver::Status st = W.lp->solve(thr == INF ? INF : thr + P.offset + 1e-9 * std::max(1.0, std::fabs(thr)));
+        const long nodes_now = ++total_nodes;
+        if (st == LpSolver::INFEASIBLE || st == LpSolver::CUTOFF) break;
+        if (st != LpSolver::OPTIMAL) {
+          if (terminated.load(std::memory_order_relaxed) || stop()) {
+            if (stop()) terminate(STOPPED);
+            break;
+          }
+          set_incomplete();
+          break;
+        }
+        const double z = W.lp->obj() - P.offset;
+        if (cur.bvar >= 0) {
+          record_pc(cur.bdir, cur.bvar, std::max(z - cur.pz, 0.0) / std::max(cur.bfrac, 1e-9));
+          cur.bvar = -1;
+        }
+        thr = H.thr();
+        if (!exact && thr < INF) {
+          terminate(SWITCH);
+          break;
+        }
+        if (round_up(z) > thr) break;
+        W.global_fix(thr);
+        W.lp->get_x(W.x);
+        if (H.lp_point && (nodes_now & 15) == 1) H.lp_point(cols, W.x);
+        if (o.node_fixing && exact && thr < INF) W.local_fix(z, thr);
+        if (o.rins && exact && thr < INF && nodes_now >= rins_at.load(std::memory_order_relaxed) &&
+            rins_time_sec() < 0.08 * now() + 0.01 * o.time_limit) {
+          if (!rins_busy.exchange(true, std::memory_order_acq_rel)) {
+            W.rins();
+            rins_busy.store(false, std::memory_order_release);
+            thr = H.thr();
+            if (round_up(z) > thr) break;
+          }
+        }
+        cand.clear();
+        for (int k = 0; k < nk; ++k)
+          if (W.x[k] > FRAC && W.x[k] < 1.0 - FRAC) cand.push_back(k);
+        if (cand.empty()) {
+          W.offer_integral();
+          break;
+        }
+        if (nonneg && (cur.depth == 0 || nodes_now % 10 == 0)) {
+          W.round_greedy();
+          thr = H.thr();
+          if (round_up(z) > thr) break;
+        }
+        if (partition && W.branch_pair(cur, z, cand)) continue;
+        const int r = W.branch_var(cur, z, thr, cand);
+        if (r == -2) break;  // both children are infeasible or cut off
+      }
+      W.undo_local();
+      {
+        std::lock_guard<std::mutex> lk(tree_mu);
+        active_bound[W.wid] = INF;
+        --active_workers;
+        update_cached_gb_locked();
+        if (open.empty() && active_workers == 0 && !terminated.load(std::memory_order_relaxed)) {
+          terminate_locked(incomplete ? INCOMPLETE : EXHAUSTED);
+        } else {
+          tree_cv.notify_all();
+        }
+      }
+    }
   }
 
   // Cut rounds at the root: separate, add the most effective cuts, solve again with the dual simplex,
@@ -319,11 +1150,12 @@ class Search {
   bool root_cuts() {
     const double t_begin = now(), t_end = t_begin + o.cut_time * o.time_limit;
     bool kept = true;
-    if (lp->solve(INF) != LpSolver::OPTIMAL) return true;
+    if (lp0->solve(INF) != LpSolver::OPTIMAL) return true;
     const SetRows rows(P, cols);
     std::mt19937 rng(o.seed * 2654435761u + 99u);
     CutPool pool;
-    double z = lp->obj() - P.offset;
+    std::vector<double> x;
+    double z = lp0->obj() - P.offset;
     int stall = 0;
     // cuts are dense rows: their nonzeros together stay below those of the loaded columns (or 50000)
     long nnz0 = 0, cut_nnz = 0;
@@ -333,7 +1165,7 @@ class Search {
     std::vector<int> ord, rptr, ridx;
     std::vector<double> rval, rlo, rup;
     for (int round = 0; round < o.cut_rounds && !stop() && now() < t_end; ++round) {
-      lp->get_x(x);
+      lp0->get_x(x);
       pool.clear();
       const int cap = std::max(20, P.m / 4);
       if (o.cuts & 4) separate_cliques(rows, x, 0.02, cap, pool);
@@ -363,11 +1195,11 @@ class Search {
         rup.push_back(pool.up[c]);
       }
       if (rlo.empty()) break;
-      lp->add_rows(rptr, ridx, rval, rlo, rup);
+      lp0->add_rows(rptr, ridx, rval, rlo, rup);
       ++R.cut_rounds;
-      if (lp->solve(INF) != LpSolver::OPTIMAL) break;  // infeasible with valid cuts: the root node finds that out again
-      const double zn = lp->obj() - P.offset;
-      const std::vector<char> rs = lp->row_status();
+      if (lp0->solve(INF) != LpSolver::OPTIMAL) break;
+      const double zn = lp0->obj() - P.offset;
+      const std::vector<char> rs = lp0->row_status();
       std::vector<int> loose;
       for (int i = P.m; i < static_cast<int>(rs.size()); ++i)
         if (rs[i] == 0) loose.push_back(i);
@@ -376,539 +1208,31 @@ class Search {
           cut_nnz -= cut_len[loose[a] - P.m];
           cut_len.erase(cut_len.begin() + (loose[a] - P.m));
         }
-        lp->remove_rows(loose);
-        if (lp->solve(INF) != LpSolver::OPTIMAL) break;
+        lp0->remove_rows(loose);
+        if (lp0->solve(INF) != LpSolver::OPTIMAL) break;
       }
       stall = zn - z < 1e-5 * std::max(1.0, std::fabs(z)) ? stall + 1 : 0;
       z = zn;
       if (stall >= 3 || round_up(z) > H.thr()) break;
-      if (H.keep && !H.keep(z, R.nodes)) {
+      if (H.keep && !check_keep(z)) {
         kept = false;
         break;
       }
     }
-    // cuts that closed next to nothing of the gap only make every node LP larger: take them out again
+    // Cuts that close little of the gap relative to the fill-in they add only slow every node LP down.
     const double thr_now = H.thr();
-    if (kept && lp->rows() > P.m && thr_now < INF && z - zr0 < 0.05 * (thr_now - zr0)) lp->remove_rows(P.m);
-    R.cuts = lp->rows() - P.m;
+    const double min_close =
+        (o.cuts == 1 && o.integral) ? std::max(0.05, 0.25 * static_cast<double>(cut_nnz) / std::max(1L, nnz0)) : 0.05;
+    if (kept && lp0->rows() > P.m && thr_now < INF && z - zr0 < min_close * (thr_now - zr0)) lp0->remove_rows(P.m);
+    R.cuts = lp0->rows() - P.m;
     R.cut_time += now() - t_begin;
-    if (lp->solve(INF) == LpSolver::OPTIMAL) {
-      zr0 = lp->obj() - P.offset;
-      lp->get_red_cost(dk);
-      last_thr = INF;
+    if (lp0->solve(INF) == LpSolver::OPTIMAL) {
+      zr0 = lp0->obj() - P.offset;
+      lp0->get_red_cost(dk);
       R.root_cut = zr0;
+      cached_gb.store(zr0, std::memory_order_relaxed);
     }
     return kept;
-  }
-
-  // Columns whose root reduced cost rules them out of every solution that still counts.
-  void global_fix(double thr) {
-    if (!(thr < last_thr)) return;
-    last_thr = thr;
-    for (int k = 0; k < nk; ++k) {
-      if (gfix[k]) continue;
-      const double dj = dk[k];
-      if (dj > 0.0 && round_up(zr0 + dj - 1e-9 * std::max(1.0, std::fabs(zr0))) > thr) {
-        gfix[k] = 1;
-        if (fv[k] == -1) lp->set_col_bounds(k, 0.0, 0.0);
-      }
-    }
-  }
-
-  // Reduced cost fixing with the LP of the node just solved: a column at zero whose reduced cost lifts
-  // the node bound past thr stays at zero in this subtree, and likewise a column at one stays at one.
-  // The fixings hold for the rest of the plunge (all later nodes are descendants) and are undone after it.
-  void local_fix(double z, double thr) {
-    lp->get_red_cost(dnode);
-    const double eps = 1e-7 * std::max(1.0, std::fabs(z));
-    for (int k = 0; k < nk; ++k) {
-      if (fv[k] != -1 || gfix[k] || lfix[k]) continue;
-      const double dk = dnode[k];
-      if (x[k] < 1e-9 && dk > 0.0 && round_up(z + dk - eps) > thr) {
-        lfix[k] = 1;
-        lfixed.push_back(k);
-        lp->set_col_bounds(k, 0.0, 0.0);
-        ++R.node_fixed;
-      } else if (x[k] > 1.0 - 1e-9 && dk < 0.0 && round_up(z - dk - eps) > thr) {
-        lfix[k] = 2;
-        lfixed.push_back(k);
-        lp->set_col_bounds(k, 1.0, 1.0);
-        ++R.node_fixed;
-      }
-    }
-  }
-
-  void undo_local() {
-    for (int k : lfixed) {
-      lfix[k] = 0;
-      if (fv[k] == -1) lp->set_col_bounds(k, 0.0, gfix[k] ? 0.0 : 1.0);
-    }
-    lfixed.clear();
-  }
-
-  void switch_to(const std::vector<int>& fix) {
-    for (int e : fix) want[e >> 1] = (e & 1) + 1;
-    for (int e : curfix) {
-      const int k = e >> 1;
-      if (want[k] - 1 != fv[k]) {
-        fv[k] = -1;
-        if (lfix[k]) lp->set_col_bounds(k, lfix[k] - 1.0, lfix[k] - 1.0);
-        else lp->set_col_bounds(k, 0.0, gfix[k] ? 0.0 : 1.0);
-      }
-    }
-    for (int e : fix) {
-      const int k = e >> 1, v = e & 1;
-      if (fv[k] != v) {
-        fv[k] = v;
-        lp->set_col_bounds(k, v, v);
-      }
-      want[k] = 0;
-    }
-    curfix = fix;
-  }
-
-  void offer_integral() {
-    std::vector<int> sol;
-    double cost = 0.0;
-    for (int k = 0; k < nk; ++k)
-      if (x[k] > 0.5) {
-        sol.push_back(cols[k]);
-        cost += P.cost[cols[k]];
-      }
-    std::sort(sol.begin(), sol.end());
-    H.offer(sol, cost);
-  }
-
-  // Exact cover search for pure partitioning problems, without LPs: take the uncovered row with the
-  // fewest usable columns, try its columns (large root LP value first, then small reduced cost),
-  // and propagate: a chosen column covers its rows and bans every column that meets them. The
-  // search restarts with a longer node limit and a reshuffled column order when it runs dry.
-  // Returns false on a stop request.
-  bool cover_search(double time_frac) {
-    const int m = P.m;
-    std::vector<int> rptr(m + 1, 0), rcol;
-    for (int k = 0; k < nk; ++k)
-      if (!gfix[k])
-        for (int q = P.cptr[cols[k]]; q < P.cptr[cols[k] + 1]; ++q) ++rptr[P.cidx[q] + 1];
-    for (int i = 0; i < m; ++i) rptr[i + 1] += rptr[i];
-    rcol.resize(rptr[m]);
-    {
-      std::vector<int> pos(rptr.begin(), rptr.end() - 1);
-      for (int k = 0; k < nk; ++k)
-        if (!gfix[k])
-          for (int q = P.cptr[cols[k]]; q < P.cptr[cols[k] + 1]; ++q) rcol[pos[P.cidx[q]]++] = k;
-    }
-    std::vector<double> key(nk);
-    std::vector<int> ban(nk, 0), avail(m), chosen_k;
-    std::vector<char> cov(m, 0);
-    std::mt19937 rng(o.seed * 69069u + 4242u);
-    std::uniform_real_distribution<double> uni(0.0, 1.0);
-    double dmax = 1e-12;
-    for (int k = 0; k < nk; ++k) dmax = std::max(dmax, std::fabs(droot[cols[k]]));
-    const double t0 = now();
-    long limit = 2000;
-    bool found = false;
-    struct Frame {
-      int row, next;
-      std::vector<int> cands;
-    };
-    for (int round = 0; !found; ++round, limit *= 2) {
-      // order key: smaller is tried first
-      const double noise = round == 0 ? 0.0 : 0.3;
-      for (int k = 0; k < nk; ++k) key[k] = droot[cols[k]] / dmax + noise * uni(rng);
-      std::fill(ban.begin(), ban.end(), 0);
-      std::fill(cov.begin(), cov.end(), 0);
-      for (int i = 0; i < m; ++i) avail[i] = rptr[i + 1] - rptr[i];
-      chosen_k.clear();
-      std::vector<Frame> stack;
-      long nodes = 0;
-      int ncov = 0;
-      auto choose = [&](int k) {
-        const int j = cols[k];
-        for (int q = P.cptr[j]; q < P.cptr[j + 1]; ++q) {
-          const int r = P.cidx[q];
-          cov[r] = 1;
-          ++ncov;
-          for (int a = rptr[r]; a < rptr[r + 1]; ++a) {
-            const int k2 = rcol[a];
-            if (ban[k2]++ == 0)
-              for (int b = P.cptr[cols[k2]]; b < P.cptr[cols[k2] + 1]; ++b) --avail[P.cidx[b]];
-          }
-        }
-        chosen_k.push_back(k);
-      };
-      auto unchoose = [&]() {
-        const int k = chosen_k.back();
-        chosen_k.pop_back();
-        const int j = cols[k];
-        for (int q = P.cptr[j]; q < P.cptr[j + 1]; ++q) {
-          const int r = P.cidx[q];
-          cov[r] = 0;
-          --ncov;
-          for (int a = rptr[r]; a < rptr[r + 1]; ++a) {
-            const int k2 = rcol[a];
-            if (--ban[k2] == 0)
-              for (int b = P.cptr[cols[k2]]; b < P.cptr[cols[k2] + 1]; ++b) ++avail[P.cidx[b]];
-          }
-        }
-      };
-      auto open_row = [&]() {  // false if some uncovered row has no usable column left
-        int best = -1;
-        for (int i = 0; i < m; ++i)
-          if (!cov[i] && (best < 0 || avail[i] < avail[best])) best = i;
-        if (best < 0 || avail[best] == 0) return false;
-        Frame f;
-        f.row = best;
-        f.next = 0;
-        for (int a = rptr[best]; a < rptr[best + 1]; ++a)
-          if (ban[rcol[a]] == 0) f.cands.push_back(rcol[a]);
-        std::sort(f.cands.begin(), f.cands.end(), [&](int a, int b) { return key[a] < key[b] || (key[a] == key[b] && a < b); });
-        stack.push_back(std::move(f));
-        return true;
-      };
-      bool exhausted = false;
-      if (!open_row()) exhausted = true;
-      while (!exhausted && !found) {
-        if ((nodes & 255) == 0 && (stop() || now() - t0 > time_frac * o.time_limit)) return !stop();
-        if (nodes > limit) break;
-        Frame& f = stack.back();
-        if (f.next > 0) unchoose();  // undo the column tried last at this level
-        if (f.next >= static_cast<int>(f.cands.size())) {
-          stack.pop_back();
-          if (stack.empty()) exhausted = true;
-          continue;
-        }
-        choose(f.cands[f.next++]);
-        ++nodes;
-        ++R.cover_nodes;
-        if (ncov == m) {
-          found = true;
-          break;
-        }
-        if (!open_row()) continue;  // dead end: the loop undoes this column and tries the next
-      }
-      if (found) {
-        std::vector<int> sol;
-        double cost = 0.0;
-        for (int k : chosen_k) {
-          sol.push_back(cols[k]);
-          cost += P.cost[cols[k]];
-        }
-        std::sort(sol.begin(), sol.end());
-        H.offer(sol, cost);
-      }
-      if (exhausted) break;  // this column set has no partition at all
-    }
-    return true;
-  }
-
-  // Feasibility pump (Fischetti, Glover & Lodi 2005): alternate between rounding the LP point and
-  // the LP point closest (in the L1 distance over the binaries) to the rounded one. A stalled
-  // rounding gets its most contested entries flipped; a repeated one gets a random shake.
-  // Returns false on a stop request. The costs of the LP are restored before returning.
-  bool feasibility_pump(double time_frac) {
-    if (lp->solve() != LpSolver::OPTIMAL) return !stop();
-    ++R.nodes;
-    lp->get_x(x);
-    std::mt19937 rng(o.seed * 40503u + 977u);
-    std::vector<char> xt(nk), prev1, prev2;
-    for (int k = 0; k < nk; ++k) xt[k] = x[k] > 0.5;
-    double cmax = 0.0;
-    for (double c : P.cost) cmax = std::max(cmax, std::fabs(c));
-    if (cmax == 0.0) cmax = 1.0;
-    const double t0 = now();
-    const double budget = time_frac * o.time_limit;
-    std::vector<std::pair<double, int>> sc;
-    bool ok = true, found = false;
-    for (int it = 0; it < 300 && !found; ++it) {
-      if (stop()) {
-        ok = false;
-        break;
-      }
-      if (now() - t0 > budget) break;
-      for (int k = 0; k < nk; ++k) lp->set_col_cost(k, xt[k] ? -cmax : cmax);
-      if (lp->solve() != LpSolver::OPTIMAL) break;
-      ++R.pump_iters;
-      lp->get_x(x);
-      bool integral_point = true, same = true;
-      for (int k = 0; k < nk; ++k) {
-        if (x[k] > FRAC && x[k] < 1.0 - FRAC) integral_point = false;
-        if ((x[k] > 0.5) != (xt[k] != 0)) same = false;
-      }
-      if (integral_point) {
-        found = true;
-        break;
-      }
-      if (!same) {
-        prev2 = prev1;
-        prev1 = xt;
-        for (int k = 0; k < nk; ++k) xt[k] = x[k] > 0.5;
-        if (xt != prev2) continue;
-      }
-      // stalled (same rounding) or a cycle of length two: flip the entries the LP disagrees with most
-      sc.clear();
-      for (int k = 0; k < nk; ++k) {
-        const double dist = std::fabs(x[k] - (xt[k] ? 1.0 : 0.0));
-        if (dist > 1e-9) sc.push_back({-dist, k});
-      }
-      std::sort(sc.begin(), sc.end());
-      const size_t flips = std::min<size_t>(sc.size(), 10 + rng() % 20);
-      for (size_t q = 0; q < flips; ++q) xt[sc[q].second] ^= 1;
-      if (sc.empty() || it % 30 == 29)  // nothing to flip, or no progress for a while: random shake
-        for (int k = 0; k < nk; ++k)
-          if (x[k] > FRAC && rng() % 4 == 0) xt[k] ^= 1;
-    }
-    for (int k = 0; k < nk; ++k) lp->set_col_cost(k, P.cost[cols[k]]);
-    if (found) {
-      offer_integral();
-      ++R.pump_found;
-    }
-    return ok;
-  }
-
-  // Restarted randomized diving while there is no incumbent: fix a variable with a large LP value
-  // to one, solve, repeat; an infeasible LP flips the last fixing, and after a few flips the dive is
-  // abandoned and a new one starts from the root (chronological backtracking alone keeps repairing
-  // the bottom of a dive whose mistake is near the top). Returns false on a stop request.
-  bool dive_for_incumbent(int max_dives, double time_frac) {
-    std::mt19937 rng(o.seed * 2654435761u + 12345u);
-    std::vector<int> fix, cand;
-    const double t0 = now();
-    const double budget = time_frac * o.time_limit;
-    for (int dive = 0; dive < max_dives && H.thr() == INF; ++dive) {
-      fix.clear();
-      int flips = 0;
-      const int max_flips = 10 + 5 * std::min(dive, 40);
-      for (;;) {
-        if (stop()) return false;
-        if (now() - t0 > budget) {  // leave the rest of the time to the complete search
-          switch_to({});
-          return true;
-        }
-        switch_to(fix);
-        const LpSolver::Status st = lp->solve();
-        ++R.nodes;
-        ++R.dive_nodes;
-        if (st != LpSolver::OPTIMAL) {
-          if (st != LpSolver::INFEASIBLE && stop()) return false;
-          while (!fix.empty() && (fix.back() & 1) == 0) fix.pop_back();
-          if (fix.empty()) {
-            if (dive == 0 && flips == 0) {  // the root itself is infeasible: the tree search will report it
-              switch_to({});
-              return true;
-            }
-            break;
-          }
-          if (++flips > max_flips) break;
-          fix.back() -= 1;  // the last variable fixed to one goes to zero instead
-          continue;
-        }
-        lp->get_x(x);
-        cand.clear();
-        for (int k = 0; k < nk; ++k)
-          if (x[k] > FRAC && x[k] < 1.0 - FRAC) cand.push_back(k);
-        if (cand.empty()) {
-          offer_integral();
-          break;
-        }
-        if (nonneg && fix.empty()) round_greedy();
-        // one of the three largest values, the largest most often
-        std::partial_sort(cand.begin(), cand.begin() + std::min<size_t>(3, cand.size()), cand.end(), [&](int a, int b) {
-          return x[a] > x[b] || (x[a] == x[b] && a < b);
-        });
-        const unsigned r = dive == 0 ? 0 : rng() % 6;
-        const size_t pick = std::min<size_t>(r < 3 ? 0 : (r < 5 ? 1 : 2), cand.size() - 1);
-        fix.push_back(cand[pick] * 2 + 1);
-      }
-      ++R.dives;
-    }
-    switch_to({});
-    return true;
-  }
-
-  // Greedy rounding for set models: take columns by decreasing LP value while they
-  // serve an unmet row and fit every row's upper side, then drop redundant ones.
-  void round_greedy() {
-    order.clear();
-    for (int k = 0; k < nk; ++k)
-      if (x[k] > FRAC) order.push_back(k);
-    std::sort(order.begin(), order.end(), [&](int a, int b) {
-      if (x[a] != x[b]) return x[a] > x[b];
-      if (P.cost[cols[a]] != P.cost[cols[b]]) return P.cost[cols[a]] < P.cost[cols[b]];
-      return a < b;
-    });
-    std::fill(act.begin(), act.end(), 0.0);
-    chosen.clear();
-    for (int k : order) {
-      const int j = cols[k];
-      bool helps = false, fits = true;
-      for (int q = P.cptr[j]; q < P.cptr[j + 1] && fits; ++q) {
-        const int i = P.cidx[q];
-        if (act[i] < P.rlo[i] - 1e-9) helps = true;
-        if (act[i] + P.cval[q] > P.rup[i] + 1e-9) fits = false;
-      }
-      if (!helps || !fits) continue;
-      chosen.push_back(j);
-      for (int q = P.cptr[j]; q < P.cptr[j + 1]; ++q) act[P.cidx[q]] += P.cval[q];
-    }
-    for (int i = 0; i < P.m; ++i)
-      if (act[i] < P.rlo[i] - 1e-9) return;
-    std::sort(chosen.begin(), chosen.end(), [&](int a, int b) { return P.cost[a] > P.cost[b] || (P.cost[a] == P.cost[b] && a < b); });
-    std::vector<int> sol;
-    double cost = 0.0;
-    for (int j : chosen) {
-      bool redundant = true;
-      for (int q = P.cptr[j]; q < P.cptr[j + 1] && redundant; ++q)
-        if (act[P.cidx[q]] - P.cval[q] < P.rlo[P.cidx[q]] - 1e-9) redundant = false;
-      if (redundant) {
-        for (int q = P.cptr[j]; q < P.cptr[j + 1]; ++q) act[P.cidx[q]] -= P.cval[q];
-      } else {
-        sol.push_back(j);
-        cost += P.cost[j];
-      }
-    }
-    if (cost <= H.thr()) {
-      std::sort(sol.begin(), sol.end());
-      H.offer(sol, cost);
-    }
-  }
-
-  // The LP is at the optimum of the node being branched on: its basis goes to the child that waits in the queue.
-  std::shared_ptr<const std::vector<char>> node_basis() const {
-    if (!o.node_basis || static_cast<double>(open.size() + 1) * (P.m + nk) > 4e8) return nullptr;
-    return std::make_shared<const std::vector<char>>(lp->get_basis());
-  }
-
-  // Ryan-Foster: two rows r, s covered together by a fractional amount. One child forbids the
-  // columns that cover exactly one of them, the other forbids the columns that cover both.
-  bool branch_pair(Node& cur, double z, const std::vector<int>& cand) {
-    const size_t m = static_cast<size_t>(P.m);
-    touched_pairs.clear();
-    for (int k : cand) {
-      const int j = cols[k];
-      for (int a = P.cptr[j]; a < P.cptr[j + 1]; ++a)
-        for (int b = a + 1; b < P.cptr[j + 1]; ++b) {
-          const size_t id = static_cast<size_t>(P.cidx[a]) * m + P.cidx[b];
-          if (pairw[id] == 0.0) touched_pairs.push_back(static_cast<int>(id));
-          pairw[id] += x[k];
-        }
-    }
-    int best = -1;
-    double bd = 0.5 - 1e-6;
-    for (int id : touched_pairs) {
-      const double d = std::fabs(pairw[id] - 0.5);
-      if (d < bd || (d == bd && id < best)) bd = d, best = id;
-    }
-    for (int id : touched_pairs) pairw[id] = 0.0;
-    if (best < 0) return false;  // only duplicate columns are fractional: branch on a variable instead
-    const int r = best / P.m, s = best % P.m;
-    rmark[r] = rmark[s] = 1;
-    Node* differ = new Node();
-    differ->basis = node_basis();
-    differ->bound = z;
-    differ->depth = cur.depth + 1;
-    differ->fix = cur.fix;
-    for (int k = 0; k < nk; ++k) {
-      if (fv[k] != -1 || gfix[k]) continue;
-      const int j = cols[k];
-      int hit = 0;
-      for (int q = P.cptr[j]; q < P.cptr[j + 1]; ++q) hit += rmark[P.cidx[q]];
-      if (hit == 1) cur.fix.push_back(k * 2);
-      else if (hit == 2) differ->fix.push_back(k * 2);
-    }
-    rmark[r] = rmark[s] = 0;
-    push(differ);
-    cur.bound = z;
-    ++cur.depth;
-    return true;
-  }
-
-  // Reliability branching. Returns the branching column, -1 after fixing a variable whose
-  // other side is impossible (the node must be solved again), -2 if the node is finished.
-  int branch_var(Node& cur, double z, double thr, std::vector<int>& cand) {
-    std::sort(cand.begin(), cand.end(), [&](int a, int b) {
-      const double fa = std::fabs(x[a] - 0.5), fb = std::fabs(x[b] - 0.5);
-      return fa < fb || (fa == fb && a < b);
-    });
-    double avg[2] = {1.0, 1.0};
-    for (int d = 0; d < 2; ++d) {
-      double s = 0.0;
-      long c = 0;
-      for (int k = 0; k < nk; ++k)
-        if (pcn[d][k]) s += pcs[d][k] / pcn[d][k], ++c;
-      if (c) avg[d] = s / c;
-    }
-    // strong branching may use up to o.strong_share of all LP iterations (always allowed near the root)
-    const bool may_strong = o.strong_cands > 0 &&
-                            (cur.depth <= 8 || sb_iters < o.strong_share * static_cast<double>(lp->iterations()));
-    const double cut = thr == INF ? INF : thr + P.offset + 1e-9 * std::max(1.0, std::fabs(thr));
-    LpSolver::State node_state;
-    bool saved = false;
-    int best = -1, tried = 0, since_best = 0;
-    double best_score = -1.0;
-    const std::vector<double> x0 = x;
-    for (int k : cand) {
-      const double f = x0[k];
-      double d0, d1;
-      const bool unreliable = pcn[0][k] < o.reliability || pcn[1][k] < o.reliability;
-      // lookahead: stop trying candidates once several in a row did not beat the best score
-      if (may_strong && unreliable && tried < o.strong_cands && since_best < o.strong_lookahead) {
-        ++tried;
-        ++since_best;
-        if (!saved) {
-          lp->save_state(node_state);
-          saved = true;
-        }
-        double zc[2];
-        for (int v = 0; v < 2; ++v) {
-          const long it0 = lp->iterations();
-          lp->set_col_bounds(k, v, v);
-          const LpSolver::Status st = lp->solve(cut, o.strong_iters);
-          ++R.strong_lps;
-          zc[v] = (st == LpSolver::INFEASIBLE || st == LpSolver::CUTOFF) ? INF
-                  : (st == LpSolver::OPTIMAL || st == LpSolver::LIMIT) ? std::max(lp->obj() - P.offset, z) : z;
-          if (zc[v] < INF && round_up(zc[v]) > thr) zc[v] = INF;
-          sb_iters += lp->iterations() - it0;
-          lp->set_col_bounds(k, 0.0, 1.0);
-          lp->restore_state(node_state);
-        }
-        if (zc[0] == INF && zc[1] == INF) return -2;
-        if (zc[0] == INF || zc[1] == INF) {
-          cur.fix.push_back(k * 2 + (zc[0] == INF ? 1 : 0));
-          return -1;
-        }
-        d0 = zc[0] - z;
-        d1 = zc[1] - z;
-        pcs[0][k] += d0 / std::max(f, 1e-9);
-        ++pcn[0][k];
-        pcs[1][k] += d1 / std::max(1.0 - f, 1e-9);
-        ++pcn[1][k];
-      } else {
-        d0 = (pcn[0][k] ? pcs[0][k] / pcn[0][k] : avg[0]) * f;
-        d1 = (pcn[1][k] ? pcs[1][k] / pcn[1][k] : avg[1]) * (1.0 - f);
-      }
-      const double score = std::max(d0, 1e-6) * std::max(d1, 1e-6);
-      if (score > best_score) best_score = score, best = k, since_best = 0;
-    }
-    Node* down = new Node();
-    down->basis = node_basis();
-    down->bound = z;
-    down->depth = cur.depth + 1;
-    down->fix = cur.fix;
-    down->fix.push_back(best * 2);
-    down->bvar = best;
-    down->bdir = 0;
-    down->bfrac = x0[best];
-    down->pz = z;
-    push(down);
-    cur.fix.push_back(best * 2 + 1);
-    cur.bound = z;
-    ++cur.depth;
-    cur.bvar = best;
-    cur.bdir = 1;
-    cur.bfrac = 1.0 - x0[best];
-    cur.pz = z;
-    return best;
   }
 };
 
