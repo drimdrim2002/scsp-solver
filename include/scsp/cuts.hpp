@@ -23,6 +23,7 @@ namespace scsp {
 struct CutPool {
   std::vector<int> ptr{0}, idx;   // row-wise, over the loaded columns
   std::vector<double> val, lo, up, efficacy;
+  std::vector<char> is_int;       // 1 if all cut coefficients are integer (zero-half / clique), 0 otherwise (GMI)
   int size() const { return static_cast<int>(lo.size()); }
   void clear();
 };
@@ -40,5 +41,10 @@ struct SetRows {
 int separate_zero_half(const SetRows& R, const std::vector<double>& x, bool covering, int max_size, double min_viol,
                        int max_cuts, std::mt19937& rng, CutPool& out);
 int separate_cliques(const SetRows& R, const std::vector<double>& x, double min_viol, int max_cuts, CutPool& out);
+// Gomory mixed-integer (GMI) cuts from simplex tableau rows of fractional basic binary variables
+// (Gomory 1960; Balas, Ceria, Cornuejols & Natraj 1996).
+// row_int[i] == 1 iff row i of `lp` has all integer coefficients (so its row activity is integer).
+int separate_gmi(LpSolver& lp, const std::vector<char>& row_int, const std::vector<double>& x, double min_viol,
+                 int max_cuts, int max_nnz, CutPool& out);
 
 }  // namespace scsp

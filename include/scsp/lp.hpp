@@ -100,11 +100,13 @@ class LpSolver {
   void set_col_cost(int k, double cost);
   std::vector<char> get_basis() const;          // one status per row, then per column
   bool set_basis(const std::vector<char>& basis);
-  // A basis together with the pricing weights that go with it; restoring it is cheaper to continue from
-  // than set_basis alone (strong branching returns to the node this way).
+  // A basis together with the pricing weights (and factored LU snapshot when valid) that go with it;
+  // restoring it is cheaper to continue from than set_basis alone (strong branching returns to the node this way).
+  struct Snapshot;
   struct State {
     std::vector<char> basis;
     std::vector<double> weights;
+    std::shared_ptr<const Snapshot> snap;
   };
   void save_state(State& s) const;
   bool restore_state(const State& s);
@@ -112,6 +114,12 @@ class LpSolver {
   void get_x(std::vector<double>& x) const;
   void get_red_cost(std::vector<double>& d) const;
   bool get_row_dual(std::vector<double>& y);    // refactorizes
+  // Tableau / row inspection for Gomory mixed-integer (GMI) cut generation (P6).
+  bool is_col_basic(int k) const;
+  bool get_tableau_row(int k, std::vector<int>& nb_var, std::vector<double>& nb_val,
+                       std::vector<char>& nb_st, std::vector<double>& nb_lo,
+                       std::vector<double>& nb_up);
+  void get_row(int i, std::vector<int>& col_idx, std::vector<double>& col_val) const;
   int cols() const;
   int rows() const;
   long iterations() const;

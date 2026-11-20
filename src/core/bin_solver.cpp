@@ -79,12 +79,14 @@ SolveResult solve_core(const LpProblem& L, const SolveOptions& opt, const std::v
   }
 
   // ---- neighbourhood search around the incumbent (sub-problems solved by the same branch and bound)
-  // Two neighbourhoods:
-  //   RINS (Danna, Rothberg & Le Pape 2005): columns on which a node LP solution and the incumbent
-  //     agree are fixed, the others are free;
-  //   fixing: a random part of the incumbent is fixed at one and the free columns are the rest of the
-  //     incumbent plus the columns with the smallest root reduced cost that still fit.
-  std::vector<int> by_rc;                 // columns by root reduced cost (written once, then root_ready)
+  // Four complementary neighbourhoods (P4/P6):
+  //   1. RINS (Danna, Rothberg & Le Pape 2005): columns on which a node LP solution and the incumbent agree are fixed;
+  //   2. Row-cluster / bridge-connected LNS (Shaw 1998; Ropke & Pisinger 2006): frees a connected cluster of incumbent
+  //      columns sharing low-RC bridging columns so far more alternative columns fit the freed region;
+  //   3. Asymmetric Local Branching (Fischetti & Lodi 2003): sum_{j in cur} x_j >= |cur| - delta over cur + low-RC pool;
+  //   4. Biased-RC fixing LNS: keeps a subset of the incumbent biased toward low-RC columns.
+  std::vector<int> by_rc, rptr, rcol;     // sorted by root reduced cost (written once in H.root, then root_ready)
+  std::vector<double> droot;
   std::atomic<bool> root_ready{false}, done{false};
   std::vector<int> pt_cols;               // latest node LP solution of the tree (under mu)
   std::vector<double> pt_x;
@@ -94,8 +96,10 @@ SolveResult solve_core(const LpProblem& L, const SolveOptions& opt, const std::v
 
   struct LnsState {
     std::mt19937_64 rng;
-    double frac = 0.5;     // share of the incumbent that stays fixed (fixing neighbourhood)
+    double frac = 0.5;     // share of the incumbent that stays fixed (fixing / cluster neighbourhood)
     long target = 0;       // free columns besides the incumbent's
+    int lb_delta = 10;     // asymmetric local branching radius delta
+    int mode_ctr = 0;
     long seen_point = 0;
     std::vector<char> inc;
   };
@@ -116,6 +120,7 @@ SolveResult solve_core(const LpProblem& L, const SolveOptions& opt, const std::v
     for (int j : cur) st.inc[j] = 1;
     std::vector<int> ones, freec;
     const bool rins = ver != st.seen_point && (st.rng() & 1);
+    int mkind = -1;
     if (rins) {
       st.seen_point = ver;
       std::vector<char> in_point(L.n, 0);
@@ -128,31 +133,161 @@ SolveResult solve_core(const LpProblem& L, const SolveOptions& opt, const std::v
       for (int j : cur)
         if (!in_point[j]) freec.push_back(j);
     } else {
-      std::shuffle(cur.begin(), cur.end(), st.rng);
-      const size_t keep = static_cast<size_t>(st.frac * static_cast<double>(cur.size()));
-      ones.assign(cur.begin(), cur.begin() + keep);
-      freec.assign(cur.begin() + keep, cur.end());
-      std::vector<double> act(L.m, 0.0);
-      for (int j : ones)
-        for (int q = L.cptr[j]; q < L.cptr[j + 1]; ++q) act[L.cidx[q]] += L.cval[q];
-      long added = 0;
-      for (int j : by_rc) {
-        if (added >= st.target) break;
-        if (st.inc[j]) continue;
-        bool fits = true;
-        if (nonneg)
-          for (int q = L.cptr[j]; q < L.cptr[j + 1] && fits; ++q)
-            if (act[L.cidx[q]] + L.cval[q] > L.rup[L.cidx[q]] + 1e-9) fits = false;
-        if (!fits) continue;
-        freec.push_back(j);
-        ++added;
+      mkind = (st.mode_ctr++) % 5;
+      if (mkind == 1 && cur.size() >= 8) {
+        // Compact Asymmetric Local Branching (Fischetti & Lodi 2003): sum_{j in cur} x_j >= |cur| - delta.
+        freec = cur;
+        const long lb_pool = std::min<long>(L.n, std::max<long>(2L * L.m, 600L));
+        long added = 0;
+        for (int j : by_rc) {
+          if (added >= lb_pool) break;
+          if (st.inc[j]) continue;
+          freec.push_back(j);
+          ++added;
+        }
+      } else if (mkind == 0 || mkind == 2 || mkind == 3) {
+        // Row-cluster / bridge-connected LNS (Shaw 1998; Ropke & Pisinger 2006).
+        const int nc = static_cast<int>(cur.size());
+        const int free_k = std::max(4, std::min(nc, nc - static_cast<int>(st.frac * static_cast<double>(nc))));
+        std::vector<int> row_owner(L.m, -1);
+        for (int u = 0; u < nc; ++u)
+          for (int q = L.cptr[cur[u]]; q < L.cptr[cur[u] + 1]; ++q) row_owner[L.cidx[q]] = u;
+        std::vector<char> freed(nc, 0);
+        std::vector<int> score(nc, 0), frontier;
+        // Tournament seed biased toward higher root reduced cost.
+        int seed_u = static_cast<int>(st.rng() % static_cast<uint64_t>(nc));
+        if ((st.rng() % 10) < 7) {
+          for (int t = 0; t < 3; ++t) {
+            const int cand_u = static_cast<int>(st.rng() % static_cast<uint64_t>(nc));
+            if (droot[cur[cand_u]] > droot[cur[seed_u]]) seed_u = cand_u;
+          }
+        }
+        auto free_u = [&](int u) {
+          freed[u] = 1;
+          const int j0 = cur[u];
+          for (int q = L.cptr[j0]; q < L.cptr[j0 + 1]; ++q) {
+            const int i = L.cidx[q];
+            const int rlim = std::min(rptr[i + 1], rptr[i] + 24);
+            for (int a = rptr[i]; a < rlim; ++a) {
+              const int j = rcol[a];
+              if (st.inc[j]) continue;
+              for (int b = L.cptr[j]; b < L.cptr[j + 1]; ++b) {
+                const int v = row_owner[L.cidx[b]];
+                if (v >= 0 && !freed[v]) {
+                  if (score[v]++ == 0) frontier.push_back(v);
+                }
+              }
+            }
+          }
+        };
+        free_u(seed_u);
+        int nfreed = 1;
+        while (nfreed < free_k) {
+          int pick = -1;
+          // Compact frontier and pick among top-3 highest-relatedness neighbours.
+          size_t w = 0;
+          for (size_t idx = 0; idx < frontier.size(); ++idx)
+            if (!freed[frontier[idx]]) frontier[w++] = frontier[idx];
+          frontier.resize(w);
+          if (!frontier.empty()) {
+            const size_t topk = std::min<size_t>(3, frontier.size());
+            std::partial_sort(frontier.begin(), frontier.begin() + topk, frontier.end(), [&](int a, int b) {
+              if (score[a] != score[b]) return score[a] > score[b];
+              return droot[cur[a]] > droot[cur[b]];
+            });
+            pick = frontier[static_cast<size_t>(st.rng() % topk)];
+          } else {
+            for (int tries = 0; tries < nc; ++tries) {
+              const int u = static_cast<int>(st.rng() % static_cast<uint64_t>(nc));
+              if (!freed[u]) {
+                pick = u;
+                break;
+              }
+            }
+            if (pick < 0) {
+              for (int u = 0; u < nc; ++u)
+                if (!freed[u]) {
+                  pick = u;
+                  break;
+                }
+            }
+          }
+          if (pick < 0) break;
+          free_u(pick);
+          ++nfreed;
+        }
+        for (int u = 0; u < nc; ++u) {
+          if (freed[u]) freec.push_back(cur[u]);
+          else ones.push_back(cur[u]);
+        }
+        std::vector<double> act(L.m, 0.0);
+        for (int j : ones)
+          for (int q = L.cptr[j]; q < L.cptr[j + 1]; ++q) act[L.cidx[q]] += L.cval[q];
+        long added = 0;
+        for (int j : by_rc) {
+          if (added >= st.target) break;
+          if (st.inc[j]) continue;
+          bool fits = true;
+          if (nonneg)
+            for (int q = L.cptr[j]; q < L.cptr[j + 1] && fits; ++q)
+              if (act[L.cidx[q]] + L.cval[q] > L.rup[L.cidx[q]] + 1e-9) fits = false;
+          if (!fits) continue;
+          freec.push_back(j);
+          ++added;
+        }
+      } else {
+        // Randomized / RC-biased fixing LNS.
+        std::shuffle(cur.begin(), cur.end(), st.rng);
+        const size_t keep = static_cast<size_t>(st.frac * static_cast<double>(cur.size()));
+        ones.assign(cur.begin(), cur.begin() + keep);
+        freec.assign(cur.begin() + keep, cur.end());
+        std::vector<double> act(L.m, 0.0);
+        for (int j : ones)
+          for (int q = L.cptr[j]; q < L.cptr[j + 1]; ++q) act[L.cidx[q]] += L.cval[q];
+        long added = 0;
+        for (int j : by_rc) {
+          if (added >= st.target) break;
+          if (st.inc[j]) continue;
+          bool fits = true;
+          if (nonneg)
+            for (int q = L.cptr[j]; q < L.cptr[j + 1] && fits; ++q)
+              if (act[L.cidx[q]] + L.cval[q] > L.rup[L.cidx[q]] + 1e-9) fits = false;
+          if (!fits) continue;
+          freec.push_back(j);
+          ++added;
+        }
       }
     }
     std::sort(freec.begin(), freec.end());
+    freec.erase(std::unique(freec.begin(), freec.end()), freec.end());
     SubProblem sub = make_sub(L, freec, ones, nonneg);
     if (!sub.ok || sub.P.n < 2) {
-      if (!rins) st.frac = std::max(0.1, st.frac - 0.05);
+      if (!rins && mkind != 1) st.frac = std::max(0.1, st.frac - 0.05);
       return true;
+    }
+    const bool is_lb = (!rins && mkind == 1 && cur.size() >= 8);
+    if (is_lb) {
+      // Append the asymmetric Local Branching constraint: sum_{k: col_of[k] in cur} x_k >= |cur| - lb_delta.
+      const int lb_row = sub.P.m++;
+      const double rhs = std::max(0.0, static_cast<double>(cur.size()) - static_cast<double>(st.lb_delta));
+      sub.P.rlo.push_back(rhs);
+      sub.P.rup.push_back(INF);
+      std::vector<int> nptr(1, 0), nidx;
+      std::vector<double> nval;
+      nidx.reserve(sub.P.cidx.size() + cur.size());
+      nval.reserve(sub.P.cval.size() + cur.size());
+      for (int k = 0; k < sub.P.n; ++k) {
+        nidx.insert(nidx.end(), sub.P.cidx.begin() + sub.P.cptr[k], sub.P.cidx.begin() + sub.P.cptr[k + 1]);
+        nval.insert(nval.end(), sub.P.cval.begin() + sub.P.cptr[k], sub.P.cval.begin() + sub.P.cptr[k + 1]);
+        if (st.inc[sub.col_of[k]]) {
+          nidx.push_back(lb_row);
+          nval.push_back(1.0);
+        }
+        nptr.push_back(static_cast<int>(nidx.size()));
+      }
+      sub.P.cptr.swap(nptr);
+      sub.P.cidx.swap(nidx);
+      sub.P.cval.swap(nval);
     }
     const double t_end = elapsed() + budget;
     BnbHooks h;
@@ -169,7 +304,9 @@ SolveResult solve_core(const LpProblem& L, const SolveOptions& opt, const std::v
     so.seed = static_cast<unsigned>(st.rng());
     so.integral = integral;
     so.time_limit = std::max(0.0, std::min(budget, opt.time_limit - elapsed()));
-    so.node_limit = node_limit;
+    so.node_limit = is_lb ? std::min<long>(node_limit, 150) : node_limit;
+    so.strong_cands = 4;
+    so.strong_iters = 40;
     const BnbResult r = branch_and_bound(sub.P, h, so);
     ++lns_calls;
     bool improved;
@@ -178,13 +315,17 @@ SolveResult solve_core(const LpProblem& L, const SolveOptions& opt, const std::v
       improved = ub < cost;
     }
     if (improved) ++lns_improved;
-    if (!rins) {
+    if (is_lb) {
+      if (r.status == BnbResult::EXHAUSTED && !improved) st.lb_delta = std::min(16, st.lb_delta + 2);
+      else if (improved) st.lb_delta = std::max(4, st.lb_delta - 1);
+      else st.lb_delta = std::max(4, st.lb_delta - 2);
+    } else if (!rins) {
       // a neighbourhood searched to the end without a better solution was too small, one that hit its limit too large
       if (r.status == BnbResult::EXHAUSTED && !improved) {
         if (st.frac > 0.15) st.frac -= 0.05;
         else st.target = std::min<long>(L.n, st.target + st.target / 4);
       } else if (r.status != BnbResult::EXHAUSTED) {
-        st.frac = std::min(0.9, st.frac + 0.05);
+        st.frac = std::min(0.92, st.frac + 0.05);
       }
     }
     return true;
@@ -192,8 +333,11 @@ SolveResult solve_core(const LpProblem& L, const SolveOptions& opt, const std::v
   auto new_state = [&](int id) {
     LnsState st;
     st.rng.seed(opt.seed * 7919ULL + 104729ULL * static_cast<unsigned>(id) + 17ULL);
-    st.frac = 0.3 + 0.15 * (id % 4);
-    st.target = std::max<long>(200, 3L * L.m);
+    static const double init_fracs[4] = {0.55, 0.65, 0.75, 0.85};
+    st.frac = init_fracs[id & 3];
+    st.target = std::max<long>(300, 3L * L.m);
+    st.lb_delta = 6 + 2 * (id % 3);
+    st.mode_ctr = id;
     return st;
   };
 
@@ -218,9 +362,21 @@ SolveResult solve_core(const LpProblem& L, const SolveOptions& opt, const std::v
   const bool lns = opt.local_search && L.n > 0 && L.m > 0;
   if (lns) {
     H.root = [&](const std::vector<double>&, const std::vector<double>& d, double) {
+      droot = d;
       by_rc.resize(L.n);
       for (int j = 0; j < L.n; ++j) by_rc[j] = j;
       std::sort(by_rc.begin(), by_rc.end(), [&](int a, int b) { return d[a] < d[b] || (d[a] == d[b] && a < b); });
+      // Row-wise column lists sorted by root reduced cost for fast bridge-connected cluster LNS.
+      rptr.assign(L.m + 1, 0);
+      for (int i : L.cidx) ++rptr[i + 1];
+      for (int i = 0; i < L.m; ++i) rptr[i + 1] += rptr[i];
+      rcol.resize(L.cidx.size());
+      std::vector<int> pos(rptr.begin(), rptr.end() - 1);
+      for (int j = 0; j < L.n; ++j)
+        for (int q = L.cptr[j]; q < L.cptr[j + 1]; ++q) rcol[pos[L.cidx[q]]++] = j;
+      for (int i = 0; i < L.m; ++i)
+        std::sort(rcol.begin() + rptr[i], rcol.begin() + rptr[i + 1],
+                  [&](int a, int b) { return d[a] < d[b] || (d[a] == d[b] && a < b); });
       root_ready.store(true, std::memory_order_release);
     };
     H.lp_point = [&](const std::vector<int>& cols, const std::vector<double>& x) {
@@ -276,7 +432,7 @@ SolveResult solve_core(const LpProblem& L, const SolveOptions& opt, const std::v
   o.seed = static_cast<unsigned>(opt.seed);
   o.integral = integral;
   o.time_limit = opt.time_limit;
-  o.cuts = opt.cuts < 0 ? 7 : opt.cuts;
+  o.cuts = opt.cuts < 0 ? 15 : opt.cuts;
   const BnbResult r = branch_and_bound(L, H, o);
   done = true;
   for (auto& t : pool) t.join();

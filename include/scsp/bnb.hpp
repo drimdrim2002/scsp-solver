@@ -69,7 +69,7 @@ struct BnbOptions {
   bool node_basis = true;      // a queued node keeps its parent's optimal basis
   bool node_fixing = true;     // reduced cost fixing at every node (for the rest of the plunge)
   // cutting planes at the root of an exact search (cuts.hpp): 1 = zero-half on covering sides,
-  // 2 = zero-half on packing sides (odd holes), 4 = cliques
+  // 2 = zero-half on packing sides (odd holes), 4 = cliques, 8 = Gomory mixed-integer (GMI)
   int cuts = 0;
   int cut_rounds = 30;
   int cut_size = 15;           // largest row set of a zero-half cut

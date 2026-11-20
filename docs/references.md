@@ -102,10 +102,14 @@ BKS 대조에서 나온 사실:
 | 제한 트리에서 해를 찾으면 바로 정확한 트리로 전환 | `bnb.cpp` `Search::run`(`SWITCH`) | 자체 구성 |
 | 시작해 생성(벤치마크용): 최선해 주변 destroy/repair("근처"), 빈 해에서 greedy + 하강("독립") | `python/scsp/bench/warm.py` | ALNS(Ropke & Pisinger 2006)의 destroy/repair를 흉내 낸 자체 구성 |
 | 병렬 branch-and-cut 트리(공유 최선 하한 큐, 워커별 독립 `LpSolver` 복제, 의사비용 공유, SC/SPP 동적 워커 합류 `BnbTeam`) | `src/core/bnb.cpp`, `lp.cpp`(`clone`), `bin_solver.cpp`, `sc_solver.cpp` | 병렬 branch-and-bound의 공유 큐·최선 하한 트리 탐색(Gendron & Crainic 1994). SC/SPP 동적 스레드 전환 규칙은 자체 구성 |
+| 적응형 hypersparse FTRAN/BTRAN(Gilbert–Peierls 도달성 DFS, 밀집 시 gather 폴백 및 지수 백오프), 희소 DSE·`pivot_row` 갱신, 행 기준 Markowitz 버킷·평면 동적 배열 LU, 강분기 LU 스냅샷 복원 | `include/scsp/lu.hpp`, `src/core/lu.cpp`, `include/scsp/lp.hpp`, `src/core/lp.cpp` | Gilbert & Peierls 1988(도달성 DFS); Hall & McKinnon 2005(hypersparse FTRAN/BTRAN·적응형 전환·희소 DSE); Suhl & Suhl 1990(행 기준 Markowitz·버킷·평면 배열). Copy-on-write L 스냅샷 및 unit-row `pivot_row`는 자체 구성 |
+| 분기·강분기·reduced-cost 고정 시 정수 비음 행 도메인/충돌 전파(SPP 충돌 열 즉시 0 고정, singleton 행 연쇄 1 고정) | `src/core/bnb.cpp` (`Worker::propagate`, `set_eff`, `start_probe`) | Savelsbergh 1994(전처리·프로빙·영역 전파) |
+| 루트 Gomory Mixed-Integer(GMI) 컷(심플렉스 태블로 행 추출, 정수/연속 슬랙 분리, 안전한 소계수 완화, 직교성 필터, 효과 미달 시 자동 롤백) | `include/scsp/lp.hpp`, `src/core/lp.cpp`(`tableau_row`), `include/scsp/cuts.hpp`, `src/core/cuts.cpp`(`separate_gmi`), `src/core/bnb.cpp`(`root_cuts`) | Balas, Ceria, Cornuéjols & Natraj 1996(GMI 컷·실용 수치 기준). 2단계 분리 및 갭 기반 자동 롤백은 자체 구성 |
+| 루트 컷 전 병렬 첫 해 탐색(전파 가속 diving / 충돌 인식 Objective FP / exact cover 동시 실행), 행 클러스터 LNS(교량 열 연결) 및 비대칭 Local Branching | `src/core/bnb.cpp`(`Search::run`, `dive_for_incumbent`, `feasibility_pump`), `src/core/bin_solver.cpp`(`lns_step`) | Achterberg & Berthold 2007(Objective FP); Fischetti & Lodi 2003(비대칭 Local Branching); Shaw 1998(클러스터 destroy/repair LNS). 병렬 스프린트 스케줄 및 교량 열 확장은 자체 구성 |
 
-솔버 기법을 구현할 때마다 이 표에 한 줄씩 추가한다(P5분까지 반영, 2026-11-19).
+솔버 기법을 구현할 때마다 이 표에 한 줄씩 추가한다(P6 3순위까지 반영, 2026-11-20).
 
-## 4. P2~P5에서 추가 인용한 문헌 (2026-11-19 Crossref·출판사 기록 대조 완료)
+## 4. P2~P6에서 추가 인용한 문헌 (Crossref·출판사 기록 대조 완료)
 
 - Harris, P.M.J. (1973). Pivot selection methods of the Devex LP code. *Math. Programming* 5(1), 1–28. doi:10.1007/BF01580108
 - Markowitz, H.M. (1957). The elimination form of the inverse and its application to linear programming. *Management Science* 3(3), 255–269. doi:10.1287/mnsc.3.3.255
@@ -114,3 +118,8 @@ BKS 대조에서 나온 사실:
 - Shaw, P. (1998). Using constraint programming and local search methods to solve vehicle routing problems. In *Principles and Practice of Constraint Programming — CP98*, LNCS 1520, 417–431. doi:10.1007/3-540-49481-2_30
 - Ropke, S., Pisinger, D. (2006). An adaptive large neighborhood search heuristic for the pickup and delivery problem with time windows. *Transportation Science* 40(4), 455–472. doi:10.1287/trsc.1050.0135
 - Gendron, B., Crainic, T.G. (1994). Parallel branch-and-bound algorithms: survey and synthesis. *Operations Research* 42(6), 1042–1066. doi:10.1287/opre.42.6.1042
+- Gilbert, J.R., Peierls, T. (1988). Sparse partial pivoting in time proportional to arithmetic operations. *SIAM J. Sci. Stat. Comput.* 9(5), 862–874. doi:10.1137/0909058
+- Hall, J.A.J., McKinnon, K.I.M. (2005). Hyper-sparsity in the revised simplex method and how to exploit it. *Computational Optimization and Applications* 32(3), 259–283. doi:10.1007/s10589-005-4802-0
+- Savelsbergh, M.W.P. (1994). Preprocessing and probing techniques for mixed integer programming problems. *ORSA J. Computing* 6(4), 445–454. doi:10.1287/ijoc.6.4.445
+- Balas, E., Ceria, S., Cornuéjols, G., Natraj, N. (1996). Gomory cuts revisited. *Operations Research Letters* 19(1), 1–9. doi:10.1016/0167-6377(96)00007-7
+- Achterberg, T., Berthold, T. (2007). Improving the feasibility pump. *Discrete Optimization* 4(1), 77–86. doi:10.1016/j.disopt.2006.10.004

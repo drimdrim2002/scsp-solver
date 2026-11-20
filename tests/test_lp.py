@@ -149,6 +149,22 @@ def test_lp_bound_is_below_the_p1_solution():
     assert sol.bound <= lp.obj + 1e-6 * abs(lp.obj) or sol.status == "optimal"    # Lagrangian bound cannot beat the LP bound
 
 
+def test_hypersparse_and_dense_regimes_match_highs():
+    """Exercises both hypersparse DFS and dense fallback paths across refactor intervals."""
+    for model in (generate_dms(n_orders=120, n_bundles=2000, seed=11),
+                  generate_sp(80, 1200, seed=12)):
+        status, ref = model_lp(model)
+        assert status == "Optimal"
+        a, lower, upper = model.to_scipy()
+        n = model.n_cols
+        for kw in (dict(method="dual", refactor=1), dict(method="dual", refactor=15),
+                   dict(method="dual", refactor=100), dict(method="sifting", refactor=25)):
+            res = solve_lp(model, **kw)
+            assert res.status == "optimal", kw
+            assert res.obj == pytest.approx(ref, rel=1e-8, abs=1e-8), kw
+            check_optimality(model.cost, a, lower, upper, np.zeros(n), np.ones(n), res, model.obj_offset)
+
+
 def test_time_limit_and_bad_input():
     model = generate_sp(60, 3000, seed=2)
     res = solve_lp(model, time_limit=0.0)

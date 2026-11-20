@@ -12,6 +12,15 @@
 
 namespace scsp {
 
+struct LpSolver::Snapshot {
+  const void* owner = nullptr;
+  uint64_t cost_epoch = 0;
+  BasisLU lu;
+  std::vector<int> head, bpos;
+  std::vector<double> d, y, x;
+  double cur_obj = 0.0;
+};
+
 namespace {
 
 const double INF = std::numeric_limits<double>::infinity();
@@ -27,7 +36,7 @@ struct Timer {
 // Variable index v: v < m is the logical of row v, v >= m is structural column v - m.
 class Simplex {
  public:
-  enum : char { BASIC = 0, LOWER = 1, UPPER = 2, FREE = 3 };
+  enum : char { BASIC = 0, LOWER = 1, UPPER = 2, FREE = 3, MARK = 4 };
   enum { OPTIMAL = 0, INFEASIBLE = 1, UNBOUNDED = 2, LIMIT = 3, FAILED = 4, CUTOFF = 5 };
   double cutoff = INF;  // dual(): stop once the dual objective (scaled costs) exceeds this
   long iter_cap = -1;   // dual(): iterations allowed in one call (-1 = no cap)
@@ -61,6 +70,7 @@ class Simplex {
     spike.assign(m, 0.0);
     rowv.assign(m, 0.0);
     posv.assign(m, 0.0);
+    rmark.assign(m, 0);
     cptr.assign(1, 0);
   }
 
@@ -79,6 +89,8 @@ class Simplex {
     bpos.push_back(-1);
     ++nc;
     factored = false;  // the new column has no reduced cost yet
+    primal_valid = false;
+    dual_valid = false;
   }
 
   // Call after adding columns and before solving.
@@ -88,33 +100,48 @@ class Simplex {
     for (int i = 0; i < m; ++i) rptr[i + 1] += rptr[i];
     ridx.resize(cidx.size());
     rval.resize(cidx.size());
+    row_unit.assign(m, 1);
     std::vector<int> pos(rptr.begin(), rptr.end() - 1);
     for (int j = 0; j < nc; ++j)
       for (int q = cptr[j]; q < cptr[j + 1]; ++q) {
         const int i = cidx[q];
-        ridx[pos[i]] = j;
-        rval[pos[i]++] = cval[q];
+        const double v = cval[q];
+        if (v != 1.0) row_unit[i] = 0;
+        ridx[pos[i]] = m + j;
+        rval[pos[i]++] = v;
       }
     arow.assign(m + nc, 0.0);
-    mark.assign(m + nc, 0);
+    touched.resize(m + nc);
+    n_touched = 0;
+    cands.resize(m + nc);
     devex.assign(m + nc, 1.0);
   }
 
-  void set_cost(int v, double cost) { c[v] = c0[v] = cost; }
+  void set_cost(int v, double cost) {
+    c[v] = c0[v] = cost;
+    ++cost_epoch;
+  }
 
   // Dual simplex with perturbed costs, then the primal simplex with the true costs.
   int solve(bool pert = true) {
-    if (!factored || pert || lu.updates() > opt.refactor / 2) {
+    if (!factored || pert || lu.updates() >= opt.refactor) {
       if (!refactor()) return FAILED;
       compute_dual();
+      dual_valid = false;
+      primal_valid = false;
     }
-    fix_dual();
+    if (!dual_valid) {
+      if (fix_dual()) primal_valid = false;
+      dual_valid = true;
+    }
     if (pert && opt.perturb) perturb();
     int s = dual();
     if (cost_mod) {  // perturbed or shifted costs: back to the true ones, the primal simplex cleans up
       c = c0;
       cost_mod = false;
       factored = false;
+      primal_valid = false;
+      dual_valid = false;
       if (s == OPTIMAL) s = primal();
     }
     return s;
@@ -122,9 +149,12 @@ class Simplex {
 
   // ---- incremental use (branch and bound) ----
   void set_bounds(int v, double l, double u) {
+    const bool was_fixed = (lo[v] == up[v]);
     lo[v] = l;
     up[v] = u;
     if (st[v] == BASIC) return;
+    const char old_st = st[v];
+    const double old_x = x[v];
     if (l == u || st[v] == LOWER) {
       if (l > -INF) st[v] = LOWER, x[v] = l;
       else if (u < INF) st[v] = UPPER, x[v] = u;
@@ -134,17 +164,69 @@ class Simplex {
       else if (l > -INF) st[v] = LOWER, x[v] = l;
       else st[v] = FREE, x[v] = 0.0;
     }
+    if (x[v] != old_x) primal_valid = false;
+    if (l != u && (was_fixed || st[v] != old_st)) dual_valid = false;
   }
 
   void change_cost(int v, double cost) {
     c[v] = c0[v] = cost;
+    ++cost_epoch;
     factored = false;  // the reduced costs have to be recomputed
+    dual_valid = false;
+    primal_valid = false;
   }
 
   const std::vector<char>& basis() const { return st; }
 
+  void sync_bounds_after_restore() {
+    bool pok = true, dok = true;
+    const int nv = m + nc;
+    for (int v = 0; v < nv; ++v) {
+      const char s = st[v];
+      if (s == BASIC) continue;
+      if (s == LOWER) {
+        if (lo[v] > -INF) {
+          if (x[v] != lo[v]) x[v] = lo[v], pok = false;
+        } else {
+          set_nonbasic(v);
+          pok = false;
+          dok = false;
+        }
+      } else if (s == UPPER) {
+        if (up[v] < INF) {
+          if (x[v] != up[v]) x[v] = up[v], pok = false;
+        } else {
+          set_nonbasic(v);
+          pok = false;
+          dok = false;
+        }
+      } else {
+        if (lo[v] > -INF || up[v] < INF) {
+          set_nonbasic(v);
+          pok = false;
+          dok = false;
+        }
+      }
+      if (dok && lo[v] != up[v]) {
+        const double dv = d[v];
+        const char ns = st[v];
+        if ((ns == LOWER && dv < -opt.opt_tol) || (ns == UPPER && dv > opt.opt_tol) ||
+            (ns == FREE && std::fabs(dv) > opt.opt_tol))
+          dok = false;
+      }
+    }
+    primal_valid = pok;
+    dual_valid = dok;
+    if (pok) cur_obj = objective();
+  }
+
   bool set_basis(const std::vector<char>& b) {
     if (static_cast<int>(b.size()) != m + nc) return false;
+    if (factored && !cost_mod && b == st) {
+      std::fill(dse.begin(), dse.end(), 1.0);
+      sync_bounds_after_restore();
+      return true;
+    }
     int k = 0;
     for (int v = 0; v < m + nc; ++v)
       if (b[v] == BASIC) ++k;
@@ -164,6 +246,8 @@ class Simplex {
     }
     std::fill(dse.begin(), dse.end(), 1.0);
     factored = false;
+    primal_valid = false;
+    dual_valid = false;
     return true;
   }
 
@@ -173,6 +257,8 @@ class Simplex {
     if (static_cast<int>(w.size()) == m) dse = w;
   }
 
+  bool can_snapshot() const { return factored && !cost_mod; }
+
   double objective() const {
     double s = 0.0;
     for (int v = m; v < m + nc; ++v) s += c0[v] * x[v];
@@ -181,12 +267,20 @@ class Simplex {
 
   // Dual simplex from the current basis (made dual feasible by bound flips and cost shifts).
   int dual() {
-    if (!factored || lu.updates() > opt.refactor / 2) {
+    if (!factored || lu.updates() >= opt.refactor) {
       if (!refactor()) return FAILED;
       compute_dual();
+      dual_valid = false;
+      primal_valid = false;
     }
-    fix_dual();
-    compute_primal();
+    if (!dual_valid) {
+      if (fix_dual()) primal_valid = false;
+      dual_valid = true;
+    }
+    if (!primal_valid) {
+      compute_primal();
+      primal_valid = true;
+    }
     bool need = false;
     int trouble = 0;
     const long it_start = it_dual;
@@ -198,15 +292,18 @@ class Simplex {
         compute_dual();
         fix_dual();
         compute_primal();
+        dual_valid = true;
+        primal_valid = true;
         need = false;
       }
       if ((it_dual & 31) == 0 && (timer.sec() > opt.time_limit || (opt.stop && opt.stop->load(std::memory_order_relaxed))))
         return LIMIT;
       if (it_dual + it_primal >= opt.max_iter) return LIMIT;
       if (iter_cap >= 0 && it_dual - it_start >= iter_cap) return LIMIT;
-      if (cutoff < INF && !cost_mod && (it_dual & 7) == 7) {
+      if (cutoff < INF && !cost_mod && cur_obj > cutoff - 1e-6 * (1.0 + std::fabs(cutoff))) {
         double ob = 0.0;
         for (int v = m; v < m + nc; ++v) ob += c[v] * x[v];
+        cur_obj = ob;
         if (ob > cutoff) return CUTOFF;
       }
       if (!stall_pert && opt.perturb && it_dual - it_start > 2L * m + 200) {  // degenerate stalling: perturb the costs now
@@ -214,18 +311,26 @@ class Simplex {
         stall_pert = true;
       }
 
-      // pricing: dual steepest edge
+      // pricing: dual steepest edge (hoisted pointers)
       int r = -1;
       double best = 0.0, delta = 0.0;
-      for (int p = 0; p < m; ++p) {
-        const int v = head[p];
-        const double xv = x[v];
-        double inf;
-        if (xv < lo[v] - opt.feas_tol) inf = xv - lo[v];
-        else if (xv > up[v] + opt.feas_tol) inf = xv - up[v];
-        else continue;
-        const double score = inf * inf / dse[p];
-        if (score > best) best = score, r = p, delta = inf;
+      {
+        const int* const hp = head.data();
+        const double* const xp = x.data();
+        const double* const lop = lo.data();
+        const double* const upp = up.data();
+        const double* const dsep = dse.data();
+        const double ftol = opt.feas_tol;
+        for (int p = 0; p < m; ++p) {
+          const int v = hp[p];
+          const double xv = xp[v];
+          double inf;
+          if (xv < lop[v] - ftol) inf = xv - lop[v];
+          else if (xv > upp[v] + ftol) inf = xv - upp[v];
+          else continue;
+          const double score = inf * inf / dsep[p];
+          if (score > best) best = score, r = p, delta = inf;
+        }
       }
       if (r < 0) {
         if (lu.updates() == 0) return OPTIMAL;
@@ -233,71 +338,106 @@ class Simplex {
         continue;
       }
       const int pv = head[r];
-      std::fill(posv.begin(), posv.end(), 0.0);
       posv[r] = 1.0;
-      lu.btran(posv, rho);
-      pivot_row();
+      posv_idx.assign(1, r);
+      const bool rho_sparse = lu.btran_sparse(posv, posv_idx, true, rho, rho_idx);
+      pivot_row(rho_sparse);
 
-      // bound flipping ratio test
+      // bound flipping ratio test (hoisted pointers + zero-flip fast path)
       const double sgn = delta > 0 ? 1.0 : -1.0;
-      cands.clear();
-      for (int v : touched) {
-        if (lo[v] == up[v]) continue;
-        const double a = sgn * arow[v];
-        const char s = st[v];
-        if ((s == LOWER && a > PIV) || (s == UPPER && a < -PIV) || (s == FREE && std::fabs(a) > PIV)) {
-          double th = s == FREE ? 0.0 : d[v] / a;
-          if (th < 0.0) th = 0.0;
-          cands.push_back({th, std::fabs(a), v});
+      int n_cands = 0;
+      int min_ci = -1;
+      double min_th = INF;
+      {
+        const double* const lop = lo.data();
+        const double* const upp = up.data();
+        const double* const dp = d.data();
+        const double* const arp = arow.data();
+        const char* const stp = st.data();
+        const int* const tp = touched.data();
+        Cand* const cp = cands.data();
+        const int nt = n_touched;
+        for (int i = 0; i < nt; ++i) {
+          const int v = tp[i];
+          if (lop[v] == upp[v]) continue;
+          const double a = sgn * arp[v];
+          const char s = static_cast<char>(stp[v] & 3);
+          if ((s == LOWER && a > PIV) || (s == UPPER && a < -PIV) || (s == FREE && std::fabs(a) > PIV)) {
+            double th = s == FREE ? 0.0 : dp[v] / a;
+            if (th < 0.0) th = 0.0;
+            const double aa = std::fabs(a);
+            if (th < min_th) min_th = th, min_ci = n_cands;
+            cp[n_cands++] = {th, aa, v};
+          }
         }
       }
       int q = -1;
       double thq = 0.0, aabs = 0.0, slope = std::fabs(delta);
       flips.clear();
       fth.clear();
-      size_t hn = cands.size();
-      std::make_heap(cands.begin(), cands.end(), cmp);
-      while (hn > 0) {
-        std::pop_heap(cands.begin(), cands.begin() + hn, cmp);
-        const Cand cd = cands[--hn];
-        const double range = up[cd.v] - lo[cd.v];
-        if (range == INF || slope - cd.a * range <= opt.feas_tol) {
-          q = cd.v, thq = cd.theta, aabs = cd.a;
-          break;
+      if (n_cands > 0) {
+        const Cand& mcd = cands[min_ci];
+        const double mrange = up[mcd.v] - lo[mcd.v];
+        if (mrange == INF || slope - mcd.a * mrange <= opt.feas_tol) {
+          // Zero-flip fast path: skip heap construction, scan linearly for largest pivot among ties.
+          q = mcd.v, thq = mcd.theta, aabs = mcd.a;
+          const double tie = 1e-12 * (1.0 + thq);
+          const Cand* const cp = cands.data();
+          for (int i = 0; i < n_cands; ++i) {
+            if (cp[i].theta - thq <= tie && cp[i].a > aabs) q = cp[i].v, aabs = cp[i].a;
+          }
+        } else {
+          size_t hn = static_cast<size_t>(n_cands);
+          std::make_heap(cands.begin(), cands.begin() + hn, cmp);
+          while (hn > 0) {
+            std::pop_heap(cands.begin(), cands.begin() + hn, cmp);
+            const Cand cd = cands[--hn];
+            const double range = up[cd.v] - lo[cd.v];
+            if (range == INF || slope - cd.a * range <= opt.feas_tol) {
+              q = cd.v, thq = cd.theta, aabs = cd.a;
+              break;
+            }
+            slope -= cd.a * range;
+            flips.push_back(cd.v);
+            fth.push_back(cd.theta);
+          }
+          if (q >= 0) {
+            const double tie = 1e-12 * (1.0 + thq);
+            while (hn > 0) {
+              std::pop_heap(cands.begin(), cands.begin() + hn, cmp);
+              const Cand cd = cands[--hn];
+              if (cd.theta - thq > tie) break;
+              if (cd.a > aabs) q = cd.v, aabs = cd.a;
+            }
+            int unflip = -1;
+            for (size_t k = flips.size(); k-- > 0;) {
+              if (thq - fth[k] > tie) break;
+              const double a = std::fabs(arow[flips[k]]);
+              if (a > aabs) q = flips[k], aabs = a, unflip = static_cast<int>(k);
+            }
+            if (unflip >= 0) flips.erase(flips.begin() + unflip);
+          }
         }
-        slope -= cd.a * range;
-        flips.push_back(cd.v);
-        fth.push_back(cd.theta);
       }
       if (q < 0) {  // the dual is unbounded along this row
         clear_row();
+        clear_vec(rho, rho_idx, rho_sparse);
         if (lu.updates() == 0) return INFEASIBLE;
         need = true;
         continue;
       }
-      // among candidates with the same ratio prefer the largest pivot element
-      const double tie = 1e-12 * (1.0 + thq);
-      while (hn > 0) {
-        std::pop_heap(cands.begin(), cands.begin() + hn, cmp);
-        const Cand cd = cands[--hn];
-        if (cd.theta - thq > tie) break;
-        if (cd.a > aabs) q = cd.v, aabs = cd.a;
-      }
-      int unflip = -1;
-      for (size_t k = flips.size(); k-- > 0;) {
-        if (thq - fth[k] > tie) break;
-        const double a = std::fabs(arow[flips[k]]);
-        if (a > aabs) q = flips[k], aabs = a, unflip = static_cast<int>(k);
-      }
-      if (unflip >= 0) flips.erase(flips.begin() + unflip);
       const double arq = arow[q];
 
-      // entering column
-      load_column(q);
-      lu.ftran(rowv, aq, &spike);
+      // entering column (hypersparse FTRAN)
+      load_column_sparse(q);
+      bool spike_sparse = false;
+      const bool aq_sparse = lu.ftran_sparse(rowv, rowv_idx, true, aq, aq_idx, &spike, &spike_idx, &spike_sparse);
       const double alpha = aq[r];
       if (std::fabs(alpha) < PIV || std::fabs(alpha - arq) > 1e-6 * (1.0 + std::fabs(alpha))) {
         clear_row();
+        clear_vec(rho, rho_idx, rho_sparse);
+        clear_vec(aq, aq_idx, aq_sparse);
+        clear_vec(spike, spike_idx, spike_sparse);
         if (lu.updates() > 0) {
           need = true;
           continue;
@@ -307,55 +447,126 @@ class Simplex {
         continue;
       }
 
-      // dual step
+      // dual step fused with clearing arow and st MARK bits (single pass over touched)
       const double thD = d[q] / arq;
-      for (int v : touched) d[v] -= thD * arow[v];
+      {
+        double* const dp = d.data();
+        double* const arp = arow.data();
+        char* const stp = st.data();
+        const int* const tp = touched.data();
+        const int nt = n_touched;
+        for (int i = 0; i < nt; ++i) {
+          const int v = tp[i];
+          dp[v] -= thD * arp[v];
+          arp[v] = 0.0;
+          stp[v] = static_cast<char>(stp[v] & 3);
+        }
+        n_touched = 0;
+      }
       d[q] = 0.0;
       d[pv] = -thD;
 
-      // bound flips
+      // bound flips (hypersparse FTRAN)
       if (!flips.empty()) {
-        std::fill(rowv.begin(), rowv.end(), 0.0);
+        const int g = next_rmark();
+        rowv_idx.clear();
         for (int v : flips) {
           double dx;
           if (st[v] == LOWER) dx = up[v] - lo[v], st[v] = UPPER, x[v] = up[v];
           else dx = lo[v] - up[v], st[v] = LOWER, x[v] = lo[v];
-          if (v < m) rowv[v] += dx;
-          else
-            for (int k = cptr[v - m]; k < cptr[v - m + 1]; ++k) rowv[cidx[k]] -= cval[k] * dx;
+          cur_obj += c[v] * dx;
+          if (v < m) {
+            rowv[v] += dx;
+            if (rmark[v] != g) rmark[v] = g, rowv_idx.push_back(v);
+          } else {
+            for (int k = cptr[v - m]; k < cptr[v - m + 1]; ++k) {
+              const int i = cidx[k];
+              rowv[i] -= cval[k] * dx;
+              if (rmark[i] != g) rmark[i] = g, rowv_idx.push_back(i);
+            }
+          }
         }
-        lu.ftran(rowv, posv);
-        for (int p = 0; p < m; ++p) x[head[p]] += posv[p];
+        const bool flip_sparse = lu.ftran_sparse(rowv, rowv_idx, true, posv, posv_idx);
+        if (flip_sparse) {
+          for (int p : posv_idx) {
+            const double dp = posv[p];
+            posv[p] = 0.0;
+            const int hv = head[p];
+            x[hv] += dp;
+            cur_obj += c[hv] * dp;
+          }
+          posv_idx.clear();
+        } else {
+          for (int p = 0; p < m; ++p) {
+            const double dp = posv[p];
+            posv[p] = 0.0;
+            if (dp != 0.0) {
+              const int hv = head[p];
+              x[hv] += dp;
+              cur_obj += c[hv] * dp;
+            }
+          }
+        }
         n_flip += static_cast<long>(flips.size());
       }
 
-      // primal step
+      // primal step (sparse over aq_idx when hypersparse)
       const double bound = delta > 0 ? up[pv] : lo[pv];
       const double thP = (x[pv] - bound) / alpha;
-      for (int p = 0; p < m; ++p)
-        if (aq[p] != 0.0) x[head[p]] -= thP * aq[p];
+      if (aq_sparse) {
+        for (int p : aq_idx) {
+          const int hv = head[p];
+          const double dx = -thP * aq[p];
+          x[hv] += dx;
+          cur_obj += c[hv] * dx;
+        }
+      } else {
+        for (int p = 0; p < m; ++p) {
+          if (aq[p] != 0.0) {
+            const int hv = head[p];
+            const double dx = -thP * aq[p];
+            x[hv] += dx;
+            cur_obj += c[hv] * dx;
+          }
+        }
+      }
       x[q] += thP;
+      cur_obj += c[q] * thP;
+      cur_obj += c[pv] * (bound - x[pv]);
       x[pv] = bound;
 
-      // dual steepest edge weights
+      // dual steepest edge weights (sparse over rho_idx and aq_idx; rho is zeroed by ftran_sparse)
       double wr = 0.0;
-      for (int i = 0; i < m; ++i) wr += rho[i] * rho[i];
-      rowv = rho;
-      lu.ftran(rowv, tau);
-      for (int p = 0; p < m; ++p) {
-        if (p == r || aq[p] == 0.0) continue;
-        const double k = aq[p] / alpha;
-        dse[p] = std::max(dse[p] - 2.0 * k * tau[p] + k * k * wr, 1e-4);
+      if (rho_sparse) {
+        for (int i : rho_idx) wr += rho[i] * rho[i];
+      } else {
+        for (int i = 0; i < m; ++i) wr += rho[i] * rho[i];
+      }
+      const bool tau_sparse = lu.ftran_sparse(rho, rho_idx, rho_sparse, tau, tau_idx);
+      if (aq_sparse) {
+        for (int p : aq_idx) {
+          if (p == r) continue;
+          const double k = aq[p] / alpha;
+          dse[p] = std::max(dse[p] - 2.0 * k * tau[p] + k * k * wr, 1e-4);
+        }
+      } else {
+        for (int p = 0; p < m; ++p) {
+          if (p == r || aq[p] == 0.0) continue;
+          const double k = aq[p] / alpha;
+          dse[p] = std::max(dse[p] - 2.0 * k * tau[p] + k * k * wr, 1e-4);
+        }
       }
       dse[r] = std::max(wr / (alpha * alpha), 1e-4);
+      clear_vec(tau, tau_idx, tau_sparse);
+      clear_vec(aq, aq_idx, aq_sparse);
 
       st[pv] = delta > 0 ? UPPER : LOWER;
       bpos[pv] = -1;
       st[q] = BASIC;
       bpos[q] = r;
       head[r] = q;
-      clear_row();
-      if (!lu.update(r, spike, alpha)) need = true;
+      if (!lu.update(r, spike, alpha, spike_sparse ? &spike_idx : nullptr)) need = true;
+      clear_vec(spike, spike_idx, spike_sparse);
       ++it_dual;
     }
   }
@@ -365,18 +576,36 @@ class Simplex {
   int primal() {
     for (int rep = 0; rep < 6; ++rep) {
       int s = primal_core(opt.perturb && rep < 3);
-      if (s != OPTIMAL) return s;
-      if (primal_feasible()) return OPTIMAL;
+      if (s != OPTIMAL) {
+        primal_valid = false;
+        dual_valid = false;
+        return s;
+      }
+      if (primal_feasible()) {
+        primal_valid = true;
+        dual_valid = true;
+        return OPTIMAL;
+      }
+      dual_valid = false;
+      primal_valid = false;
       s = dual();
       c = c0;
       cost_mod = false;
       if (s != OPTIMAL) {
         factored = false;
+        primal_valid = false;
+        dual_valid = false;
         return s;
       }
       compute_dual();
-      if (dual_feasible()) return OPTIMAL;
+      if (dual_feasible()) {
+        primal_valid = true;
+        dual_valid = true;
+        return OPTIMAL;
+      }
     }
+    primal_valid = false;
+    dual_valid = false;
     return FAILED;
   }
 
@@ -385,6 +614,92 @@ class Simplex {
     if (!refactor()) return false;
     compute_primal();
     compute_dual();
+    primal_valid = true;
+    dual_valid = false;
+    return true;
+  }
+
+  // Extracts the simplex tableau row for basic structural column k (0 <= k < nc).
+  // Leaves all internal scratch vectors cleanly zeroed.
+  bool tableau_row(int k, std::vector<int>& nb_var, std::vector<double>& nb_val, std::vector<char>& nb_st,
+                   std::vector<double>& nb_lo, std::vector<double>& nb_up) {
+    if (!factored || k < 0 || k >= nc) return false;
+    const int r = bpos[m + k];
+    if (r < 0) return false;
+    posv[r] = 1.0;
+    posv_idx.assign(1, r);
+    const bool rho_sparse = lu.btran_sparse(posv, posv_idx, true, rho, rho_idx);
+    pivot_row(rho_sparse);
+    clear_vec(rho, rho_idx, rho_sparse);
+    nb_var.clear();
+    nb_val.clear();
+    nb_st.clear();
+    nb_lo.clear();
+    nb_up.clear();
+    double* const arp = arow.data();
+    char* const stp = st.data();
+    const int* const tp = touched.data();
+    const int nt = n_touched;
+    for (int i = 0; i < nt; ++i) {
+      const int v = tp[i];
+      const double av = arp[v];
+      arp[v] = 0.0;
+      const char sv = static_cast<char>(stp[v] & 3);
+      stp[v] = sv;
+      if (std::fabs(av) > 1e-13) {
+        nb_var.push_back(v);
+        nb_val.push_back(av);
+        nb_st.push_back(sv);
+        nb_lo.push_back(lo[v]);
+        nb_up.push_back(up[v]);
+      }
+    }
+    n_touched = 0;
+    return true;
+  }
+
+  void row_entries(int i, std::vector<int>& col_idx, std::vector<double>& col_val) const {
+    col_idx.clear();
+    col_val.clear();
+    if (i < 0 || i >= m) return;
+    const int beg = rptr[i], end = rptr[i + 1];
+    col_idx.reserve(static_cast<size_t>(end - beg));
+    col_val.reserve(static_cast<size_t>(end - beg));
+    for (int q = beg; q < end; ++q) {
+      col_idx.push_back(ridx[q] - m);
+      col_val.push_back(rval[q]);
+    }
+  }
+
+  void fill_snapshot(LpSolver::Snapshot& sd) const {
+    sd.owner = this;
+    sd.cost_epoch = cost_epoch;
+    sd.lu = lu;
+    sd.head = head;
+    sd.bpos = bpos;
+    sd.d = d;
+    sd.y = y;
+    sd.x = x;
+    sd.cur_obj = cur_obj;
+  }
+
+  bool restore_snapshot(const std::vector<char>& b, const std::vector<double>& w, const LpSolver::Snapshot& sd) {
+    if (sd.owner != this || sd.cost_epoch != cost_epoch || static_cast<int>(b.size()) != m + nc) return false;
+    if (cost_mod) {
+      c = c0;
+      cost_mod = false;
+    }
+    st = b;
+    if (static_cast<int>(w.size()) == m) dse = w;
+    lu = sd.lu;
+    head = sd.head;
+    bpos = sd.bpos;
+    d = sd.d;
+    y = sd.y;
+    x = sd.x;
+    cur_obj = sd.cur_obj;
+    factored = true;
+    sync_bounds_after_restore();
     return true;
   }
 
@@ -393,6 +708,23 @@ class Simplex {
     double theta, a;
     int v;
   };
+
+  static void clear_vec(std::vector<double>& v, std::vector<int>& idx, bool sparse) {
+    if (sparse) {
+      for (int k : idx) v[k] = 0.0;
+      idx.clear();
+    } else {
+      std::fill(v.begin(), v.end(), 0.0);
+    }
+  }
+
+  int next_rmark() {
+    if (++rmark_gen == 0x7fffffff) {
+      std::fill(rmark.begin(), rmark.end(), 0);
+      rmark_gen = 1;
+    }
+    return rmark_gen;
+  }
 
   bool primal_feasible() const {
     for (int p = 0; p < m; ++p) {
@@ -452,7 +784,7 @@ class Simplex {
     return s;
   }
 
-  // Devex pricing, Harris ratio test.
+  // Devex pricing, Harris ratio test (hypersparse FTRAN/BTRAN).
   int primal_loop() {
     std::fill(devex.begin(), devex.end(), 1.0);
     bool need = false;
@@ -486,35 +818,53 @@ class Simplex {
         continue;
       }
       const double sg = d[q] < 0 ? 1.0 : -1.0;  // direction of x_q
-      load_column(q);
-      lu.ftran(rowv, aq, &spike);
+      load_column_sparse(q);
+      bool spike_sparse = false;
+      const bool aq_sparse = lu.ftran_sparse(rowv, rowv_idx, true, aq, aq_idx, &spike, &spike_idx, &spike_sparse);
 
-      // Harris ratio test
+      // Harris ratio test (sparse over aq_idx when hypersparse)
       double tmax = INF;
-      for (int p = 0; p < m; ++p) {
+      auto pass1 = [&](int p) {
         const double a = sg * aq[p];
-        if (std::fabs(a) <= PIV) continue;
+        if (std::fabs(a) <= PIV) return;
         const int v = head[p];
         const double slack = a > 0 ? x[v] - lo[v] : up[v] - x[v];
-        if (slack == INF) continue;
+        if (slack == INF) return;
         tmax = std::min(tmax, (std::max(slack, 0.0) + opt.feas_tol) / std::fabs(a));
+      };
+      if (aq_sparse) {
+        for (int p : aq_idx) pass1(p);
+      } else {
+        for (int p = 0; p < m; ++p) pass1(p);
       }
       int r = -1;
       double amax = 0.0, tr = INF;
-      if (tmax < INF)
-        for (int p = 0; p < m; ++p) {
+      if (tmax < INF) {
+        auto pass2 = [&](int p) {
           const double a = sg * aq[p];
-          if (std::fabs(a) <= PIV) continue;
+          if (std::fabs(a) <= PIV) return;
           const int v = head[p];
           const double slack = a > 0 ? x[v] - lo[v] : up[v] - x[v];
-          if (slack == INF) continue;
+          if (slack == INF) return;
           const double t = std::max(slack, 0.0) / std::fabs(a);
           if (t <= tmax && std::fabs(a) > amax) amax = std::fabs(a), r = p, tr = t;
+        };
+        if (aq_sparse) {
+          for (int p : aq_idx) pass2(p);
+        } else {
+          for (int p = 0; p < m; ++p) pass2(p);
         }
+      }
       const double range = up[q] - lo[q];
       if (range < INF && (r < 0 || range <= tr)) {  // the entering variable reaches its other bound
-        for (int p = 0; p < m; ++p)
-          if (aq[p] != 0.0) x[head[p]] -= sg * range * aq[p];
+        if (aq_sparse) {
+          for (int p : aq_idx) x[head[p]] -= sg * range * aq[p];
+        } else {
+          for (int p = 0; p < m; ++p)
+            if (aq[p] != 0.0) x[head[p]] -= sg * range * aq[p];
+        }
+        clear_vec(aq, aq_idx, aq_sparse);
+        clear_vec(spike, spike_idx, spike_sparse);
         if (st[q] == LOWER) st[q] = UPPER, x[q] = up[q];
         else st[q] = LOWER, x[q] = lo[q];
         ++n_flip;
@@ -522,34 +872,55 @@ class Simplex {
         continue;
       }
       if (r < 0) {
+        clear_vec(aq, aq_idx, aq_sparse);
+        clear_vec(spike, spike_idx, spike_sparse);
         if (lu.updates() == 0) return UNBOUNDED;
         need = true;
         continue;
       }
       const double alpha = aq[r];
       const int pv = head[r];
-      for (int p = 0; p < m; ++p)
-        if (aq[p] != 0.0) x[head[p]] -= sg * tr * aq[p];
+      if (aq_sparse) {
+        for (int p : aq_idx) x[head[p]] -= sg * tr * aq[p];
+      } else {
+        for (int p = 0; p < m; ++p)
+          if (aq[p] != 0.0) x[head[p]] -= sg * tr * aq[p];
+      }
+      clear_vec(aq, aq_idx, aq_sparse);
       x[q] += sg * tr;
       const bool to_lower = sg * alpha > 0;
       x[pv] = to_lower ? lo[pv] : up[pv];
 
       // pivot row for the reduced cost and Devex updates
-      std::fill(posv.begin(), posv.end(), 0.0);
       posv[r] = 1.0;
-      lu.btran(posv, rho);
-      pivot_row();
+      posv_idx.assign(1, r);
+      const bool rho_sparse = lu.btran_sparse(posv, posv_idx, true, rho, rho_idx);
+      pivot_row(rho_sparse);
+      clear_vec(rho, rho_idx, rho_sparse);
       if (std::fabs(arow[q] - alpha) > 1e-6 * (1.0 + std::fabs(alpha)) && lu.updates() > 0 && ++trouble < 1000) {
         // inaccurate factors: restore nothing, recompute everything from the new basis
         need = true;
       }
       const double thD = d[q] / alpha;
       const double wq = devex[q];
-      for (int v : touched) {
-        if (v == q) continue;
-        d[v] -= thD * arow[v];
-        const double k = arow[v] / alpha;
-        devex[v] = std::max(devex[v], k * k * wq);
+      {
+        double* const dp = d.data();
+        double* const dvx = devex.data();
+        double* const arp = arow.data();
+        char* const stp = st.data();
+        const int* const tp = touched.data();
+        const int nt = n_touched;
+        for (int i = 0; i < nt; ++i) {
+          const int v = tp[i];
+          const double av = arp[v];
+          arp[v] = 0.0;
+          stp[v] = static_cast<char>(stp[v] & 3);
+          if (v == q) continue;
+          dp[v] -= thD * av;
+          const double k = av / alpha;
+          dvx[v] = std::max(dvx[v], k * k * wq);
+        }
+        n_touched = 0;
       }
       d[q] = 0.0;
       d[pv] = -thD;
@@ -561,9 +932,9 @@ class Simplex {
       st[q] = BASIC;
       bpos[q] = r;
       head[r] = q;
-      clear_row();
       if (reset) std::fill(devex.begin(), devex.end(), 1.0);
-      if (!lu.update(r, spike, alpha)) need = true;
+      if (!lu.update(r, spike, alpha, spike_sparse ? &spike_idx : nullptr)) need = true;
+      clear_vec(spike, spike_idx, spike_sparse);
       ++it_primal;
     }
   }
@@ -575,13 +946,20 @@ class Simplex {
   std::vector<double> cval, rval;
   BasisLU lu;
   std::vector<double> dse, devex, rho, aq, tau, spike, rowv, posv, arow, fth, lo_save, up_save;
-  std::vector<char> mark;
+  std::vector<int> posv_idx, rowv_idx, rho_idx, aq_idx, tau_idx, spike_idx, rmark;
+  int rmark_gen = 0;
+  std::vector<char> row_unit;
   std::vector<int> touched, flips;
+  int n_touched = 0;
   std::vector<Cand> cands;
   std::vector<std::pair<int, int>> bad;
   const double minus_one = -1.0;
-  bool factored = false;  // the LU factors belong to the current basis and d is current
-  bool cost_mod = false;  // c differs from c0 (perturbation or shifting)
+  uint64_t cost_epoch = 0;
+  double cur_obj = 0.0;
+  bool factored = false;      // the LU factors belong to the current basis and d is current
+  bool cost_mod = false;      // c differs from c0 (perturbation or shifting)
+  bool primal_valid = false;  // x_B matches current basis & nonbasic bounds
+  bool dual_valid = false;    // nonbasic variables are dual feasible for current bounds & d
 
   BasisLU::Col column(int v) const {
     if (v < m) return {&lidx[v], &minus_one, 1};
@@ -589,10 +967,16 @@ class Simplex {
     return {cidx.data() + cptr[j], cval.data() + cptr[j], cptr[j + 1] - cptr[j]};
   }
 
-  void load_column(int v) {
-    std::fill(rowv.begin(), rowv.end(), 0.0);
+  void load_column_sparse(int v) {
+    rowv_idx.clear();
     const BasisLU::Col col = column(v);
-    for (int k = 0; k < col.len; ++k) rowv[col.idx[k]] = col.val[k];
+    for (int k = 0; k < col.len; ++k) {
+      const double val = col.val[k];
+      if (val != 0.0) {
+        rowv[col.idx[k]] = val;
+        rowv_idx.push_back(col.idx[k]);
+      }
+    }
   }
 
   void set_nonbasic(int v) {
@@ -622,7 +1006,6 @@ class Simplex {
   }
 
   void compute_primal() {
-    std::fill(rowv.begin(), rowv.end(), 0.0);
     for (int i = 0; i < m; ++i)
       if (st[i] != BASIC) rowv[i] += x[i];
     for (int j = 0; j < nc; ++j) {
@@ -631,13 +1014,19 @@ class Simplex {
       if (st[v] == BASIC || xv == 0.0) continue;
       for (int q = cptr[j]; q < cptr[j + 1]; ++q) rowv[cidx[q]] -= cval[q] * xv;
     }
-    lu.ftran(rowv, posv);
-    for (int p = 0; p < m; ++p) x[head[p]] = posv[p];
+    lu.ftran(rowv, posv);  // clears rowv to zero
+    for (int p = 0; p < m; ++p) {
+      x[head[p]] = posv[p];
+      posv[p] = 0.0;
+    }
+    double ob = 0.0;
+    for (int v = m; v < m + nc; ++v) ob += c[v] * x[v];
+    cur_obj = ob;
   }
 
   void compute_dual() {
     for (int p = 0; p < m; ++p) posv[p] = c[head[p]];
-    lu.btran(posv, y);
+    lu.btran(posv, y);  // clears posv to zero
     for (int i = 0; i < m; ++i) d[i] = st[i] == BASIC ? 0.0 : c[i] + y[i];
     for (int j = 0; j < nc; ++j) {
       const int v = m + j;
@@ -653,22 +1042,33 @@ class Simplex {
 
   // Makes the nonbasic variables dual feasible: boxed variables move to the other
   // bound, the others get their cost shifted (removed again before the primal phase).
-  void fix_dual() {
+  // Returns true iff any nonbasic x[v] changed.
+  bool fix_dual() {
+    bool x_changed = false;
     const int nv = m + nc;
     for (int v = 0; v < nv; ++v) {
       const char s = st[v];
       if (s == BASIC || lo[v] == up[v]) continue;
       const double dv = d[v];
       if (s == LOWER && dv < -opt.opt_tol) {
-        if (up[v] < INF) st[v] = UPPER, x[v] = up[v];
-        else c[v] -= dv, d[v] = 0.0, cost_mod = true;
+        if (up[v] < INF) {
+          if (x[v] != up[v]) x_changed = true;
+          st[v] = UPPER, x[v] = up[v];
+        } else {
+          c[v] -= dv, d[v] = 0.0, cost_mod = true;
+        }
       } else if (s == UPPER && dv > opt.opt_tol) {
-        if (lo[v] > -INF) st[v] = LOWER, x[v] = lo[v];
-        else c[v] -= dv, d[v] = 0.0, cost_mod = true;
+        if (lo[v] > -INF) {
+          if (x[v] != lo[v]) x_changed = true;
+          st[v] = LOWER, x[v] = lo[v];
+        } else {
+          c[v] -= dv, d[v] = 0.0, cost_mod = true;
+        }
       } else if (s == FREE && std::fabs(dv) > opt.opt_tol) {
         c[v] -= dv, d[v] = 0.0, cost_mod = true;
       }
     }
+    return x_changed;
   }
 
   void perturb() {
@@ -687,30 +1087,75 @@ class Simplex {
   }
 
   // Row r of the tableau for the nonbasic variables: arow[v] = rho' a_v.
-  void pivot_row() {
-    for (int i = 0; i < m; ++i) {
-      const double ri = rho[i];
-      if (std::fabs(ri) < 1e-14) continue;
-      if (st[i] != BASIC) {
-        arow[i] = -ri;
-        mark[i] = 1;
-        touched.push_back(i);
-      }
-      for (int q = rptr[i]; q < rptr[i + 1]; ++q) {
-        const int v = m + ridx[q];
-        if (st[v] == BASIC) continue;
-        if (!mark[v]) {
-          mark[v] = 1;
-          touched.push_back(v);
+  // Hoists raw pointers, uses bit-4 of st[v] as visited mark, and skips rval loads on unit rows.
+  void pivot_row(bool rho_sparse) {
+    const double* const rhop = rho.data();
+    const int* const rp = rptr.data();
+    const int* const ri_arr = ridx.data();
+    const double* const rv_arr = rval.data();
+    const char* const ru = row_unit.data();
+    char* const stp = st.data();
+    double* const arp = arow.data();
+    int* const tp = touched.data();
+    int nt = n_touched;
+
+    auto process = [&](int i) {
+      const double ri = rhop[i];
+      if (std::fabs(ri) < 1e-14) return;
+      const char si = stp[i];
+      if (si != BASIC) {
+        arp[i] = -ri;
+        if (!(si & MARK)) {
+          stp[i] = static_cast<char>(si | MARK);
+          tp[nt++] = i;
         }
-        arow[v] += ri * rval[q];
       }
+      const int beg = rp[i], end = rp[i + 1];
+      if (ru[i]) {
+        for (int q = beg; q < end; ++q) {
+          const int v = ri_arr[q];
+          const char sv = stp[v];
+          if (sv == BASIC) continue;
+          if (!(sv & MARK)) {
+            stp[v] = static_cast<char>(sv | MARK);
+            tp[nt++] = v;
+          }
+          arp[v] += ri;
+        }
+      } else {
+        for (int q = beg; q < end; ++q) {
+          const int v = ri_arr[q];
+          const char sv = stp[v];
+          if (sv == BASIC) continue;
+          if (!(sv & MARK)) {
+            stp[v] = static_cast<char>(sv | MARK);
+            tp[nt++] = v;
+          }
+          arp[v] += ri * rv_arr[q];
+        }
+      }
+    };
+    if (rho_sparse) {
+      const int* const idxp = rho_idx.data();
+      const size_t n = rho_idx.size();
+      for (size_t k = 0; k < n; ++k) process(idxp[k]);
+    } else {
+      for (int i = 0; i < m; ++i) process(i);
     }
+    n_touched = nt;
   }
 
   void clear_row() {
-    for (int v : touched) arow[v] = 0.0, mark[v] = 0;
-    touched.clear();
+    double* const arp = arow.data();
+    char* const stp = st.data();
+    const int* const tp = touched.data();
+    const int nt = n_touched;
+    for (int i = 0; i < nt; ++i) {
+      const int v = tp[i];
+      arp[v] = 0.0;
+      stp[v] = static_cast<char>(stp[v] & 3);
+    }
+    n_touched = 0;
   }
 };
 
@@ -994,8 +1439,16 @@ bool LpSolver::set_basis(const std::vector<char>& b) { return impl_->S->set_basi
 void LpSolver::save_state(State& s) const {
   s.basis = impl_->S->basis();
   s.weights = impl_->S->weights();
+  if (impl_->S->can_snapshot()) {
+    auto snap = std::make_shared<Snapshot>();
+    impl_->S->fill_snapshot(*snap);
+    s.snap = std::move(snap);
+  } else {
+    s.snap.reset();
+  }
 }
 bool LpSolver::restore_state(const State& s) {
+  if (s.snap && impl_->S->restore_snapshot(s.basis, s.weights, *s.snap)) return true;
   if (!impl_->S->set_basis(s.basis)) return false;
   impl_->S->set_weights(s.weights);
   return true;
@@ -1027,6 +1480,18 @@ bool LpSolver::get_row_dual(std::vector<double>& y) {
   y.resize(I.m);
   for (int i = 0; i < I.m; ++i) y[i] = I.S->y[i] * I.cs;
   return true;
+}
+bool LpSolver::is_col_basic(int k) const {
+  const Impl& I = *impl_;
+  return k >= 0 && k < I.nc && I.S->st[I.m + k] == Simplex::BASIC;
+}
+bool LpSolver::get_tableau_row(int k, std::vector<int>& nb_var, std::vector<double>& nb_val,
+                               std::vector<char>& nb_st, std::vector<double>& nb_lo,
+                               std::vector<double>& nb_up) {
+  return impl_->S->tableau_row(k, nb_var, nb_val, nb_st, nb_lo, nb_up);
+}
+void LpSolver::get_row(int i, std::vector<int>& col_idx, std::vector<double>& col_val) const {
+  impl_->S->row_entries(i, col_idx, col_val);
 }
 
 LpResult solve_lp(const LpProblem& P, const LpOptions& opt) {

@@ -19,6 +19,7 @@ void CutPool::clear() {
   lo.clear();
   up.clear();
   efficacy.clear();
+  is_int.clear();
 }
 
 SetRows::SetRows(const LpProblem& P, const std::vector<int>& cols) : m(P.m), nk(static_cast<int>(cols.size())) {
@@ -180,6 +181,7 @@ int separate_zero_half(const SetRows& R, const std::vector<double>& x, bool cove
     out.lo.push_back(covering ? rhs : -INF);
     out.up.push_back(covering ? INF : rhs);
     out.efficacy.push_back(viol / std::sqrt(norm));
+    out.is_int.push_back(1);
     ++added;
   }
   return added;
@@ -286,6 +288,156 @@ int separate_cliques(const SetRows& R, const std::vector<double>& x, double min_
     out.lo.push_back(-INF);
     out.up.push_back(1.0);
     out.efficacy.push_back((sum - 1.0) / std::sqrt(static_cast<double>(C.size())));
+    out.is_int.push_back(1);
+    ++added;
+  }
+  return added;
+}
+
+// Gomory mixed-integer (GMI) cuts (Balas, Ceria, Cornuejols & Natraj 1996).
+// From tableau row  x_B + sum_{v in N} a_v (x_v - x_bar_v) = x_bar_B  with x_B binary and
+// f0 = x_bar_B - floor(x_bar_B) in [0.05, 0.95], shifts each nonbasic v to s_v >= 0, forms
+// sum pi_v s_v >= 1, and substitutes row logicals r_i = sum_k A_{ik} x_k back into x-space.
+int separate_gmi(LpSolver& lp, const std::vector<char>& row_int, const std::vector<double>& x, double min_viol,
+                 int max_cuts, int max_nnz, CutPool& out) {
+  const int m = lp.rows(), nk = lp.cols();
+  if (m <= 0 || nk <= 0 || max_cuts <= 0 || static_cast<int>(x.size()) != nk) return 0;
+
+  std::vector<int> cands;
+  for (int k = 0; k < nk; ++k) {
+    const double f0 = x[k] - std::floor(x[k]);
+    if (f0 >= 0.05 && f0 <= 0.95 && lp.is_col_basic(k)) cands.push_back(k);
+  }
+  if (cands.empty()) return 0;
+  std::sort(cands.begin(), cands.end(), [&](int a, int b) {
+    const double fa = std::fabs((x[a] - std::floor(x[a])) - 0.5);
+    const double fb = std::fabs((x[b] - std::floor(x[b])) - 0.5);
+    return fa < fb || (fa == fb && a < b);
+  });
+  const int try_limit = std::min<int>(static_cast<int>(cands.size()), std::max(max_cuts * 3, 60));
+
+  std::vector<int> nb_var, rcols, gtouched;
+  std::vector<double> nb_val, nb_lo, nb_up, rvals, gamma(nk, 0.0);
+  std::vector<char> nb_st, gmark(nk, 0);
+  std::vector<std::pair<int, double>> entries;
+
+  auto clear_gamma = [&]() {
+    for (int col : gtouched) gamma[col] = 0.0, gmark[col] = 0;
+    gtouched.clear();
+  };
+  auto add_gamma = [&](int col, double v) {
+    if (!gmark[col]) {
+      gmark[col] = 1;
+      gtouched.push_back(col);
+    }
+    gamma[col] += v;
+  };
+
+  int added = 0;
+  for (int ci = 0; ci < try_limit && added < max_cuts; ++ci) {
+    const int k = cands[ci];
+    const double f0 = x[k] - std::floor(x[k]);
+    if (f0 < 0.05 || f0 > 0.95) continue;
+    if (!lp.get_tableau_row(k, nb_var, nb_val, nb_st, nb_lo, nb_up)) continue;
+
+    double beta = 1.0;
+    bool ok = true;
+    for (size_t t = 0; t < nb_var.size(); ++t) {
+      const int v = nb_var[t];
+      const double av = nb_val[t];
+      const char sv = nb_st[t];
+      const double lv = nb_lo[t], uv = nb_up[t];
+      if (lv == uv) continue;  // fixed variable (e.g., equality row logical or globally fixed col): s_v == 0
+      if (sv == 3) {           // free nonbasic variable with nonzero tableau coefficient: skip row
+        ok = false;
+        break;
+      }
+      const bool at_lower = (sv == 1);
+      const double bnd = at_lower ? lv : uv;
+      if (!std::isfinite(bnd)) {
+        ok = false;
+        break;
+      }
+      const double alpha = at_lower ? av : -av;
+      const bool v_int = (v >= m) ? (std::floor(bnd) == bnd)
+                                  : (v < static_cast<int>(row_int.size()) && row_int[v] != 0 && std::floor(bnd) == bnd);
+      double pi = 0.0;
+      if (v_int) {
+        const double fv = alpha - std::floor(alpha);
+        if (fv < 1e-12 || fv > 1.0 - 1e-12) continue;
+        pi = (fv <= f0) ? (fv / f0) : ((1.0 - fv) / (1.0 - f0));
+      } else {
+        if (std::fabs(alpha) < 1e-12) continue;
+        pi = (alpha > 0.0) ? (alpha / f0) : (-alpha / (1.0 - f0));
+      }
+      if (pi <= 1e-12 || !std::isfinite(pi)) continue;
+      if (v >= m) {
+        const int col = v - m;
+        if (at_lower) {
+          add_gamma(col, pi);
+          beta += pi * lv;
+        } else {
+          add_gamma(col, -pi);
+          beta -= pi * uv;
+        }
+      } else {
+        lp.get_row(v, rcols, rvals);
+        if (at_lower) {
+          for (size_t q = 0; q < rcols.size(); ++q) add_gamma(rcols[q], pi * rvals[q]);
+          beta += pi * lv;
+        } else {
+          for (size_t q = 0; q < rcols.size(); ++q) add_gamma(rcols[q], -pi * rvals[q]);
+          beta -= pi * uv;
+        }
+      }
+    }
+    if (!ok || gtouched.empty() || !std::isfinite(beta)) {
+      clear_gamma();
+      continue;
+    }
+
+    double max_abs = 0.0;
+    for (int col : gtouched) max_abs = std::max(max_abs, std::fabs(gamma[col]));
+    if (max_abs < 1e-9 || !std::isfinite(max_abs)) {
+      clear_gamma();
+      continue;
+    }
+    // Safe small-coefficient relaxation: for 0 <= x_col <= 1, dropping tiny positive gamma[col] lowers beta by gamma[col].
+    const double tiny = 1e-6 * max_abs;
+    entries.clear();
+    double min_abs = INF, lhs = 0.0, norm2 = 0.0;
+    for (int col : gtouched) {
+      const double g = gamma[col];
+      if (std::fabs(g) < tiny) {
+        if (g > 0.0) beta -= g;
+        continue;
+      }
+      entries.push_back({col, g});
+      min_abs = std::min(min_abs, std::fabs(g));
+      lhs += g * x[col];
+      norm2 += g * g;
+    }
+    clear_gamma();
+    if (entries.empty() || static_cast<int>(entries.size()) > max_nnz) continue;
+    if (max_abs / min_abs > 1e6) continue;  // dynamism safeguard
+
+    const double inv = 1.0 / max_abs;
+    const double b_norm = beta * inv;
+    const double viol = b_norm - lhs * inv;
+    const double norm = std::sqrt(norm2) * inv;
+    const double eff = norm > 0.0 ? viol / norm : 0.0;
+    if (viol < min_viol || eff < 0.002) continue;
+
+    std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (const auto& e : entries) {
+      out.idx.push_back(e.first);
+      out.val.push_back(e.second * inv);
+    }
+    out.ptr.push_back(static_cast<int>(out.idx.size()));
+    out.lo.push_back(b_norm - 1e-9 * (1.0 + std::fabs(b_norm)));
+    out.up.push_back(INF);
+    out.efficacy.push_back(eff);
+    out.is_int.push_back(0);
     ++added;
   }
   return added;

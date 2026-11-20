@@ -1313,7 +1313,7 @@ void run_hybrid(Shared& S, int id, bool with_worker, int reserve = -1) {
   o.integral = P.integral;
   o.time_limit = std::max(0.0, S.opt.time_limit - S.elapsed());
   o.ryan_foster = false;
-  o.cuts = S.opt.cuts < 0 ? 1 : S.opt.cuts;
+  o.cuts = S.opt.cuts < 0 ? 9 : S.opt.cuts;
   o.rins = S.opt.local_search;
   H.incumbent = [&S](std::vector<int>& cols) {
     std::lock_guard<std::mutex> g(S.mu);

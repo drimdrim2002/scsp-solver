@@ -110,6 +110,72 @@ class Search {
     partition = pure_sp && o.ryan_foster;
     if (partition && static_cast<double>(P.m) * P.m > 8e6) partition = false;
     active_bound.push_back(INF);  // slot 0: main thread
+
+    // Exact integer nonnegative domain propagation tables (Savelsbergh 1994), read-only across workers.
+    const int m = P.m;
+    std::vector<char> prop_row(m, 1);
+    for (int k = 0; k < nk; ++k) {
+      const int j = cols[k];
+      for (int q = P.cptr[j]; q < P.cptr[j + 1]; ++q) {
+        const double v = P.cval[q];
+        if (v < 0.0 || v > 1e9 || std::floor(v) != v) prop_row[P.cidx[q]] = 0;
+      }
+    }
+    row_has_lo.assign(m, 0);
+    row_has_up.assign(m, 0);
+    rlo_int.assign(m, 0);
+    rup_int.assign(m, 0);
+    row_max_coef.assign(m, 0);
+    init_max_act.assign(m, 0);
+    for (int i = 0; i < m; ++i) {
+      if (!prop_row[i]) continue;
+      if (P.rlo[i] > -INF && P.rlo[i] < 1e15) {
+        row_has_lo[i] = 1;
+        rlo_int[i] = static_cast<std::int64_t>(std::ceil(P.rlo[i] - 1e-9));
+      }
+      if (P.rup[i] < INF && P.rup[i] > -1e15) {
+        row_has_up[i] = 1;
+        rup_int[i] = static_cast<std::int64_t>(std::floor(P.rup[i] + 1e-9));
+      }
+      if (!row_has_lo[i] && !row_has_up[i]) prop_row[i] = 0;
+    }
+    pr_ptr.assign(m + 1, 0);
+    pk_ptr.assign(nk + 1, 0);
+    for (int k = 0; k < nk; ++k) {
+      const int j = cols[k];
+      for (int q = P.cptr[j]; q < P.cptr[j + 1]; ++q) {
+        const int i = P.cidx[q];
+        if (!prop_row[i] || P.cval[q] == 0.0) continue;
+        const auto a = static_cast<std::int64_t>(P.cval[q]);
+        ++pr_ptr[i + 1];
+        ++pk_ptr[k + 1];
+        init_max_act[i] += a;
+        if (a > row_max_coef[i]) row_max_coef[i] = a;
+      }
+    }
+    for (int i = 0; i < m; ++i) pr_ptr[i + 1] += pr_ptr[i];
+    for (int k = 0; k < nk; ++k) pk_ptr[k + 1] += pk_ptr[k];
+    pr_col.resize(pr_ptr[m]);
+    pr_val.resize(pr_ptr[m]);
+    pk_row.resize(pk_ptr[nk]);
+    pk_val.resize(pk_ptr[nk]);
+    std::vector<int> rpos(pr_ptr.begin(), pr_ptr.end() - 1);
+    std::vector<int> kpos(pk_ptr.begin(), pk_ptr.end() - 1);
+    for (int k = 0; k < nk; ++k) {
+      const int j = cols[k];
+      for (int q = P.cptr[j]; q < P.cptr[j + 1]; ++q) {
+        const int i = P.cidx[q];
+        if (!prop_row[i] || P.cval[q] == 0.0) continue;
+        const auto a = static_cast<std::int64_t>(P.cval[q]);
+        const int rp = rpos[i]++;
+        pr_col[rp] = k;
+        pr_val[rp] = a;
+        const int kp = kpos[k]++;
+        pk_row[kp] = i;
+        pk_val[kp] = a;
+      }
+    }
+    has_prop = !pr_col.empty();
   }
 
   ~Search() {
@@ -123,13 +189,95 @@ class Search {
       R.lp_iters += lp0->iterations();
       return STOPPED;
     }
+    const bool may_parallel = H.team != nullptr || o.threads > 1;
+
+    // Concurrent first-incumbent sprint BEFORE root cuts (P6): when no incumbent exists yet,
+    // solve the clean pre-cut LP once and launch diving + objective/conflict-aware FP + exact cover
+    // in parallel so a feasible solution is found quickly (low Primal Integral) and LNS workers
+    // can immediately start improving it even while root cuts run.
+    if (H.thr() == INF) {
+      if (lp0->solve(INF) == LpSolver::OPTIMAL) {
+        const double sprint_frac = exact ? std::min(0.04, 0.6 / std::max(1.0, o.time_limit))
+                                         : std::min(0.04, 0.7 / std::max(1.0, o.time_limit));
+        if (may_parallel) {
+          template_lp = lp0->clone(o.seed, time_left, &abort_lp);
+          heur_role.store(0, std::memory_order_relaxed);
+          sprint_done.store(false, std::memory_order_release);
+          auto sprint_helper = [&](const std::function<bool()>& stay) {
+            if (sprint_done.load(std::memory_order_acquire) || H.thr() < INF || stop()) return;
+            std::unique_ptr<LpSolver> wlp;
+            const int role = heur_role.fetch_add(1, std::memory_order_relaxed) + 1;
+            {
+              std::lock_guard<std::mutex> lk(clone_mu);
+              if (sprint_done.load(std::memory_order_relaxed) || H.thr() < INF || !template_lp) return;
+              wlp = template_lp->clone(o.seed + 7919u * static_cast<unsigned>(role),
+                                       std::max(0.0, time_left - now()), &abort_lp);
+            }
+            Worker W(*this, role, std::move(wlp));
+            auto keep_going = [&]() {
+              return !sprint_done.load(std::memory_order_relaxed) && H.thr() == INF && (!stay || stay());
+            };
+            if (role == 1) W.feasibility_pump(sprint_frac * 1.25, keep_going);
+            else if (role == 2 && pure_sp) W.cover_search(sprint_frac, keep_going);
+            else W.dive_for_incumbent(8, sprint_frac, role, keep_going);
+            std::lock_guard<std::mutex> lk(tree_mu);
+            R.lp_iters += W.lp->iterations();
+          };
+          std::vector<std::thread> sprint_pool;
+          if (H.team) H.team->activate(sprint_helper);
+          for (int t = 1; t < o.threads; ++t) sprint_pool.emplace_back([&]() { sprint_helper(nullptr); });
+          const double sprint_end = now() + sprint_frac * o.time_limit;
+          {
+            Worker W0(*this, 0, std::move(lp0));
+            W0.dive_for_incumbent(8, sprint_frac, 0, nullptr);
+            if (H.thr() == INF && !stop() && now() < sprint_end) {
+              W0.dive_for_incumbent(12, std::max(0.0, (sprint_end - now()) / std::max(1e-6, o.time_limit)), 17, nullptr);
+            }
+            lp0 = std::move(W0.lp);
+          }
+          if (H.thr() < INF || stop() || now() >= sprint_end) {
+            sprint_done.store(true, std::memory_order_release);
+          }
+          for (auto& th : sprint_pool) th.join();
+          sprint_done.store(true, std::memory_order_release);
+          if (H.team) H.team->deactivate();
+          template_lp.reset();
+        } else {
+          Worker W0(*this, 0, std::move(lp0));
+          W0.dive_for_incumbent(1, sprint_frac, 0, nullptr);
+          if (H.thr() == INF && pure_sp && !stop()) W0.cover_search(sprint_frac, nullptr);
+          if (H.thr() == INF && !stop()) W0.feasibility_pump(sprint_frac, nullptr);
+          lp0 = std::move(W0.lp);
+        }
+        if (stop()) {
+          R.lp_iters += lp0->iterations();
+          R.dives += a_dives.load(std::memory_order_relaxed);
+          R.dive_nodes += a_dive_nodes.load(std::memory_order_relaxed);
+          R.pump_iters += a_pump_iters.load(std::memory_order_relaxed);
+          R.pump_found += a_pump_found.load(std::memory_order_relaxed);
+          R.cover_nodes += a_cover_nodes.load(std::memory_order_relaxed);
+          R.nodes = total_nodes.load(std::memory_order_relaxed);
+          return STOPPED;
+        }
+        if (!exact && H.thr() < INF) {
+          R.lp_iters += lp0->iterations();
+          R.dives += a_dives.load(std::memory_order_relaxed);
+          R.dive_nodes += a_dive_nodes.load(std::memory_order_relaxed);
+          R.pump_iters += a_pump_iters.load(std::memory_order_relaxed);
+          R.pump_found += a_pump_found.load(std::memory_order_relaxed);
+          R.cover_nodes += a_cover_nodes.load(std::memory_order_relaxed);
+          R.nodes = total_nodes.load(std::memory_order_relaxed);
+          return SWITCH;
+        }
+      }
+    }
+
     if (o.cuts && exact && !root_cuts()) {
       R.gave_up = true;
       R.lp_iters += lp0->iterations();
       return STOPPED;
     }
     // Prepare template LP for parallel helpers right after root cuts (clean [0,1] bounds + optimal root basis).
-    const bool may_parallel = H.team != nullptr || o.threads > 1;
     if (may_parallel) {
       template_lp = lp0->clone(o.seed, time_left, &abort_lp);
     }
@@ -138,20 +286,10 @@ class Search {
     // Build main worker (slot 0) taking ownership of lp0.
     Worker main_w(*this, 0, std::move(lp0));
 
-    // First incumbent: one LP dive (good solutions on easy problems) and, for partitioning problems,
-    // the cover search. If the best-first tree has still found nothing after a while, the feasibility
-    // pump and restarted dives get their turn; a restricted column set that yields nothing is given up.
-    if (H.thr() == INF) {
-      bool ok = main_w.dive_for_incumbent(1, 0.1);
-      if (ok && H.thr() == INF && pure_sp) ok = main_w.cover_search(0.1);
-      if (!ok) {
-        finish_worker(main_w);
-        R.nodes = total_nodes.load(std::memory_order_relaxed);
-        return STOPPED;
-      }
-    }
-    heur_at = H.thr() == INF ? total_nodes.load(std::memory_order_relaxed) + 3000 : -1;
-    heur_time = now() + 0.1 * o.time_limit;
+    // If still no incumbent after the initial sprint: on a restricted column set (!exact), give B&B
+    // only a short budget before widening the column set (NO_INCUMBENT); on exact, run fallback FP/dives later.
+    heur_at = H.thr() == INF ? total_nodes.load(std::memory_order_relaxed) + (exact ? 3000 : 300) : -1;
+    heur_time = now() + (exact ? 0.1 * o.time_limit : std::min(0.4, 0.025 * o.time_limit));
 
     // Activate cooperative helpers (external BnbTeam and/or internal threads).
     if (H.team) {
@@ -177,6 +315,11 @@ class Search {
     finish_worker(main_w);
     if (gave_up_flag.load(std::memory_order_relaxed)) R.gave_up = true;
     R.lp_iters += rins_lp_iters;
+    R.dives += a_dives.load(std::memory_order_relaxed);
+    R.dive_nodes += a_dive_nodes.load(std::memory_order_relaxed);
+    R.pump_iters += a_pump_iters.load(std::memory_order_relaxed);
+    R.pump_found += a_pump_found.load(std::memory_order_relaxed);
+    R.cover_nodes += a_cover_nodes.load(std::memory_order_relaxed);
     R.nodes = total_nodes.load(std::memory_order_relaxed);
     return exit_code;
   }
@@ -206,7 +349,10 @@ class Search {
   std::atomic<bool> abort_lp{false};
   std::atomic<bool> terminated{false};
   std::atomic<bool> gave_up_flag{false};
+  std::atomic<bool> sprint_done{false};
+  std::atomic<int> heur_role{0};
   std::atomic<long> total_nodes{0};
+  std::atomic<long> a_dives{0}, a_dive_nodes{0}, a_pump_iters{0}, a_pump_found{0}, a_cover_nodes{0};
   std::atomic<size_t> open_size{0};
   std::atomic<double> cached_gb{-INF};
   std::atomic<bool> rins_busy{false};
@@ -239,12 +385,21 @@ class Search {
   // Keep hook guarded by keep_mu
   std::mutex keep_mu;
 
+  // Read-only exact integer nonnegative propagation tables (shared across workers).
+  bool has_prop = false;
+  std::vector<char> row_has_lo, row_has_up;
+  std::vector<std::int64_t> rlo_int, rup_int, row_max_coef, init_max_act;
+  std::vector<int> pr_ptr, pr_col, pk_ptr, pk_row;
+  std::vector<std::int64_t> pr_val, pk_val;
+
   struct Worker {
     Search& S;
     int wid;
     std::unique_ptr<LpSolver> lp;
-    std::vector<int> fv, curfix, want, lfixed;
-    std::vector<char> gfix, lfix, rmark;
+    std::vector<int> fv, curfix, want, lfixed, pfixed, dirty_rows;
+    std::vector<char> gfix, lfix, pfix, rmark, row_in_q;
+    std::vector<std::int8_t> eff;
+    std::vector<std::int64_t> min_act, max_act;
     std::vector<double> x, dnode, act, pairw;
     std::vector<int> order, chosen, touched_pairs;
     double last_thr = INF;
@@ -252,73 +407,231 @@ class Search {
 
     Worker(Search& S_, int wid_, std::unique_ptr<LpSolver> lp_)
         : S(S_), wid(wid_), lp(std::move(lp_)), fv(S_.nk, -1), want(S_.nk, 0), gfix(S_.nk, 0), lfix(S_.nk, 0),
+          pfix(S_.nk, 0), row_in_q(S_.P.m, 0), eff(S_.nk, -1), min_act(S_.P.m, 0), max_act(S_.init_max_act),
           act(S_.P.m, 0.0) {
       if (S.partition) {
         rmark.assign(S.P.m, 0);
         pairw.assign(static_cast<size_t>(S.P.m) * S.P.m, 0.0);
       }
+      if (S.has_prop) {
+        for (int i = 0; i < S.P.m; ++i) {
+          if (S.row_has_lo[i] && max_act[i] - S.rlo_int[i] < S.row_max_coef[i]) {
+            row_in_q[i] = 1;
+            dirty_rows.push_back(i);
+          }
+        }
+      }
     }
 
-    void global_fix(double thr) {
-      if (!(thr < last_thr)) return;
+    void clear_dirty() {
+      for (int i : dirty_rows) row_in_q[i] = 0;
+      dirty_rows.clear();
+    }
+
+    void set_eff(int k, std::int8_t nv) {
+      const std::int8_t ov = eff[k];
+      if (ov == nv) return;
+      eff[k] = nv;
+      lp->set_col_bounds(k, nv == 1 ? 1.0 : 0.0, nv == 0 ? 0.0 : 1.0);
+      if (!S.has_prop) return;
+      const int beg = S.pk_ptr[k], end = S.pk_ptr[k + 1];
+      for (int q = beg; q < end; ++q) {
+        const int i = S.pk_row[q];
+        const std::int64_t a = S.pk_val[q];
+        if (ov == 1) min_act[i] -= a;
+        else if (ov == 0) max_act[i] += a;
+        if (nv == 1) min_act[i] += a;
+        else if (nv == 0) max_act[i] -= a;
+        if (row_in_q[i]) continue;
+        const bool trig =
+            (S.row_has_up[i] && (min_act[i] > S.rup_int[i] ||
+                                 (S.rup_int[i] - min_act[i] < S.row_max_coef[i] && max_act[i] > min_act[i]))) ||
+            (S.row_has_lo[i] && (max_act[i] < S.rlo_int[i] ||
+                                 (min_act[i] < S.rlo_int[i] && max_act[i] - S.rlo_int[i] < S.row_max_coef[i] &&
+                                  max_act[i] > min_act[i])));
+        if (trig) {
+          row_in_q[i] = 1;
+          dirty_rows.push_back(i);
+        }
+      }
+    }
+
+    std::int8_t desired_eff(int k, bool& conflict) const {
+      std::int8_t v = static_cast<std::int8_t>(fv[k]);
+      if (gfix[k]) {
+        if (v == 1) {
+          conflict = true;
+          return 0;
+        }
+        v = 0;
+      }
+      if (lfix[k]) {
+        const std::int8_t lv = static_cast<std::int8_t>(lfix[k] - 1);
+        if (v != -1 && v != lv) {
+          conflict = true;
+          return v;
+        }
+        v = lv;
+      }
+      if (pfix[k]) {
+        const std::int8_t pv = static_cast<std::int8_t>(pfix[k] - 1);
+        if (v != -1 && v != pv) {
+          conflict = true;
+          return v;
+        }
+        v = pv;
+      }
+      return v;
+    }
+
+    bool global_fix(double thr) {
+      if (!(thr < last_thr)) return false;
       last_thr = thr;
+      bool conflict = false;
       for (int k = 0; k < S.nk; ++k) {
         if (gfix[k]) continue;
         const double dj = S.dk[k];
         if (dj > 0.0 && S.round_up(S.zr0 + dj - 1e-9 * std::max(1.0, std::fabs(S.zr0))) > thr) {
           gfix[k] = 1;
-          if (fv[k] == -1) lp->set_col_bounds(k, 0.0, 0.0);
+          if (eff[k] == 1) conflict = true;
+          else set_eff(k, 0);
         }
       }
+      return conflict;
     }
 
-    void local_fix(double z, double thr) {
+    bool local_fix(double z, double thr) {
       lp->get_red_cost(dnode);
       const double eps = 1e-7 * std::max(1.0, std::fabs(z));
+      bool any = false;
       for (int k = 0; k < S.nk; ++k) {
-        if (fv[k] != -1 || gfix[k] || lfix[k]) continue;
+        if (eff[k] != -1) continue;
         const double dk_val = dnode[k];
         if (x[k] < 1e-9 && dk_val > 0.0 && S.round_up(z + dk_val - eps) > thr) {
           lfix[k] = 1;
           lfixed.push_back(k);
-          lp->set_col_bounds(k, 0.0, 0.0);
+          set_eff(k, 0);
           ++local_fixed;
+          any = true;
         } else if (x[k] > 1.0 - 1e-9 && dk_val < 0.0 && S.round_up(z - dk_val - eps) > thr) {
           lfix[k] = 2;
           lfixed.push_back(k);
-          lp->set_col_bounds(k, 1.0, 1.0);
+          set_eff(k, 1);
           ++local_fixed;
+          any = true;
         }
       }
+      return any;
     }
 
     void undo_local() {
       for (int k : lfixed) {
         lfix[k] = 0;
-        if (fv[k] == -1) lp->set_col_bounds(k, 0.0, gfix[k] ? 0.0 : 1.0);
+        bool c = false;
+        set_eff(k, desired_eff(k, c));
       }
       lfixed.clear();
     }
 
-    void switch_to(const std::vector<int>& fix) {
+    bool propagate(bool to_probe) {
+      if (!S.has_prop || dirty_rows.empty()) return true;
+      size_t qh = 0;
+      while (qh < dirty_rows.size()) {
+        const int i = dirty_rows[qh++];
+        row_in_q[i] = 0;
+        if (S.row_has_up[i]) {
+          if (min_act[i] > S.rup_int[i]) {
+            clear_dirty();
+            return false;
+          }
+          const std::int64_t rem_up = S.rup_int[i] - min_act[i];
+          if (rem_up < S.row_max_coef[i] && max_act[i] > min_act[i]) {
+            const int beg = S.pr_ptr[i], end = S.pr_ptr[i + 1];
+            for (int q = beg; q < end; ++q) {
+              const int k = S.pr_col[q];
+              if (eff[k] == -1 && S.pr_val[q] > rem_up) {
+                if (to_probe) {
+                  pfix[k] = 1;
+                  pfixed.push_back(k);
+                } else {
+                  lfix[k] = 1;
+                  lfixed.push_back(k);
+                  ++local_fixed;
+                }
+                set_eff(k, 0);
+              }
+            }
+          }
+        }
+        if (S.row_has_lo[i]) {
+          if (max_act[i] < S.rlo_int[i]) {
+            clear_dirty();
+            return false;
+          }
+          const std::int64_t slack_lo = max_act[i] - S.rlo_int[i];
+          if (min_act[i] < S.rlo_int[i] && slack_lo < S.row_max_coef[i] && max_act[i] > min_act[i]) {
+            const int beg = S.pr_ptr[i], end = S.pr_ptr[i + 1];
+            for (int q = beg; q < end; ++q) {
+              const int k = S.pr_col[q];
+              if (eff[k] == -1 && S.pr_val[q] > slack_lo) {
+                if (to_probe) {
+                  pfix[k] = 2;
+                  pfixed.push_back(k);
+                } else {
+                  lfix[k] = 2;
+                  lfixed.push_back(k);
+                  ++local_fixed;
+                }
+                set_eff(k, 1);
+              }
+            }
+          }
+        }
+      }
+      dirty_rows.clear();
+      return true;
+    }
+
+    bool start_probe(int k, int v) {
+      if (eff[k] != -1) return eff[k] == v;
+      pfix[k] = static_cast<char>(v + 1);
+      pfixed.push_back(k);
+      set_eff(k, static_cast<std::int8_t>(v));
+      return propagate(true);
+    }
+
+    void undo_probe() {
+      for (int k : pfixed) {
+        pfix[k] = 0;
+        bool c = false;
+        set_eff(k, desired_eff(k, c));
+      }
+      pfixed.clear();
+      clear_dirty();
+    }
+
+    bool switch_to(const std::vector<int>& fix) {
       for (int e : fix) want[e >> 1] = (e & 1) + 1;
       for (int e : curfix) {
         const int k = e >> 1;
         if (want[k] - 1 != fv[k]) {
           fv[k] = -1;
-          if (lfix[k]) lp->set_col_bounds(k, lfix[k] - 1.0, lfix[k] - 1.0);
-          else lp->set_col_bounds(k, 0.0, gfix[k] ? 0.0 : 1.0);
+          bool c = false;
+          set_eff(k, desired_eff(k, c));
         }
       }
+      bool ok = true;
       for (int e : fix) {
         const int k = e >> 1, v = e & 1;
-        if (fv[k] != v) {
-          fv[k] = v;
-          lp->set_col_bounds(k, v, v);
-        }
         want[k] = 0;
+        if (fv[k] != v) fv[k] = v;
+        bool c = false;
+        const std::int8_t nv = desired_eff(k, c);
+        if (c) ok = false;
+        else set_eff(k, nv);
       }
       curfix = fix;
+      return ok;
     }
 
     void offer_integral() {
@@ -441,8 +754,8 @@ class Search {
       S.rins_at.store(std::max<long>(20, nn * (improved ? 4 : 8)), std::memory_order_relaxed);
     }
 
-    // Exact cover search for pure partitioning problems, without LPs (called on worker 0 only).
-    bool cover_search(double time_frac) {
+    // Exact cover search for pure partitioning problems, without LPs (safe to run concurrently).
+    bool cover_search(double time_frac, const std::function<bool()>& stay = nullptr) {
       const int m = S.P.m;
       std::vector<int> rptr(m + 1, 0), rcol;
       for (int k = 0; k < S.nk; ++k)
@@ -459,7 +772,7 @@ class Search {
       std::vector<double> key(S.nk);
       std::vector<int> ban(S.nk, 0), avail(m), chosen_k;
       std::vector<char> cov(m, 0);
-      std::mt19937 rng(S.o.seed * 69069u + 4242u);
+      std::mt19937 rng(S.o.seed * 69069u + 4242u + static_cast<unsigned>(wid) * 1009u);
       std::uniform_real_distribution<double> uni(0.0, 1.0);
       double dmax = 1e-12;
       for (int k = 0; k < S.nk; ++k) dmax = std::max(dmax, std::fabs(S.droot[S.cols[k]]));
@@ -470,7 +783,7 @@ class Search {
         int row, next;
         std::vector<int> cands;
       };
-      for (int round = 0; !found; ++round, limit *= 2) {
+      for (int round = 0; !found && S.H.thr() == INF; ++round, limit *= 2) {
         const double noise = round == 0 ? 0.0 : 0.3;
         for (int k = 0; k < S.nk; ++k) key[k] = S.droot[S.cols[k]] / dmax + noise * uni(rng);
         std::fill(ban.begin(), ban.end(), 0);
@@ -527,7 +840,9 @@ class Search {
         bool exhausted = false;
         if (!open_row()) exhausted = true;
         while (!exhausted && !found) {
-          if ((nodes & 255) == 0 && (S.stop() || S.now() - t0 > time_frac * S.o.time_limit)) return !S.stop();
+          if ((nodes & 255) == 0 && (S.stop() || S.terminated.load(std::memory_order_relaxed) ||
+                                     S.H.thr() < INF || (stay && !stay()) || S.now() - t0 > time_frac * S.o.time_limit))
+            return !S.stop();
           if (nodes > limit) break;
           Frame& f = stack.back();
           if (f.next > 0) unchoose();
@@ -538,7 +853,7 @@ class Search {
           }
           choose(f.cands[f.next++]);
           ++nodes;
-          ++S.R.cover_nodes;
+          S.a_cover_nodes.fetch_add(1, std::memory_order_relaxed);
           if (ncov == m) {
             found = true;
             break;
@@ -560,15 +875,58 @@ class Search {
       return true;
     }
 
-    // Feasibility pump (called on worker 0 only).
-    bool feasibility_pump(double time_frac) {
+    // Objective & conflict-aware feasibility pump (Fischetti, Glover & Lodi 2005; Achterberg & Berthold 2007).
+    bool feasibility_pump(double time_frac, const std::function<bool()>& stay = nullptr) {
       switch_to({});
       if (lp->solve() != LpSolver::OPTIMAL) return !S.stop();
       ++S.total_nodes;
       lp->get_x(x);
-      std::mt19937 rng(S.o.seed * 40503u + 977u);
+      std::mt19937 rng(S.o.seed * 40503u + 977u + static_cast<unsigned>(wid) * 3571u);
+      bool has_pack = false;
+      std::vector<char> is_pack(S.P.m, 0);
+      for (int i = 0; i < S.P.m; ++i) {
+        if (S.row_has_up[i] && S.rup_int[i] == 1 && S.row_max_coef[i] == 1) {
+          is_pack[i] = 1;
+          has_pack = true;
+        }
+      }
+      std::vector<int> rord;
+      std::vector<char> rused(S.P.m, 0);
+      auto round_xt = [&](std::vector<char>& xt) {
+        if (!has_pack) {
+          for (int k = 0; k < S.nk; ++k) xt[k] = x[k] > 0.5;
+          return;
+        }
+        std::fill(xt.begin(), xt.end(), 0);
+        std::fill(rused.begin(), rused.end(), 0);
+        rord.clear();
+        for (int k = 0; k < S.nk; ++k)
+          if (x[k] > 1e-6 && !gfix[k]) rord.push_back(k);
+        std::sort(rord.begin(), rord.end(), [&](int a, int b) {
+          if (x[a] != x[b]) return x[a] > x[b];
+          return S.P.cost[S.cols[a]] < S.P.cost[S.cols[b]];
+        });
+        for (int k : rord) {
+          bool ok_k = true;
+          const int beg = S.pk_ptr[k], end = S.pk_ptr[k + 1];
+          for (int q = beg; q < end; ++q) {
+            const int i = S.pk_row[q];
+            if (is_pack[i] && rused[i]) {
+              ok_k = false;
+              break;
+            }
+          }
+          if (!ok_k) continue;
+          xt[k] = 1;
+          for (int q = beg; q < end; ++q) {
+            const int i = S.pk_row[q];
+            if (is_pack[i]) rused[i] = 1;
+          }
+        }
+      };
+
       std::vector<char> xt(S.nk), prev1, prev2;
-      for (int k = 0; k < S.nk; ++k) xt[k] = x[k] > 0.5;
+      round_xt(xt);
       double cmax = 0.0;
       for (double c : S.P.cost) cmax = std::max(cmax, std::fabs(c));
       if (cmax == 0.0) cmax = 1.0;
@@ -576,15 +934,21 @@ class Search {
       const double budget = time_frac * S.o.time_limit;
       std::vector<std::pair<double, int>> sc;
       bool ok = true, found = false;
+      double alpha = 0.5;
       for (int it = 0; it < 300 && !found; ++it) {
         if (S.stop()) {
           ok = false;
           break;
         }
-        if (S.now() - t0 > budget || S.H.thr() < INF) break;
-        for (int k = 0; k < S.nk; ++k) lp->set_col_cost(k, xt[k] ? -cmax : cmax);
+        if (S.terminated.load(std::memory_order_relaxed) || (stay && !stay()) || S.now() - t0 > budget ||
+            S.H.thr() < INF)
+          break;
+        const double l1_w = (1.0 - alpha) * cmax;
+        for (int k = 0; k < S.nk; ++k) lp->set_col_cost(k, (xt[k] ? -l1_w : l1_w) + alpha * S.P.cost[S.cols[k]]);
+        alpha *= 0.85;
+        if (alpha < 1e-3) alpha = 0.0;
         if (lp->solve() != LpSolver::OPTIMAL) break;
-        ++S.R.pump_iters;
+        S.a_pump_iters.fetch_add(1, std::memory_order_relaxed);
         lp->get_x(x);
         bool integral_point = true, same = true;
         for (int k = 0; k < S.nk; ++k) {
@@ -594,6 +958,14 @@ class Search {
         if (integral_point) {
           found = true;
           break;
+        }
+        std::vector<char> next_xt(S.nk);
+        round_xt(next_xt);
+        if (next_xt != xt && next_xt != prev1 && next_xt != prev2) {
+          prev2 = prev1;
+          prev1 = xt;
+          xt.swap(next_xt);
+          continue;
         }
         if (!same) {
           prev2 = prev1;
@@ -616,14 +988,15 @@ class Search {
       for (int k = 0; k < S.nk; ++k) lp->set_col_cost(k, S.P.cost[S.cols[k]]);
       if (found) {
         offer_integral();
-        ++S.R.pump_found;
+        S.a_pump_found.fetch_add(1, std::memory_order_relaxed);
       }
       return ok;
     }
 
-    // Restarted randomized diving while there is no incumbent (called on worker 0 only).
-    bool dive_for_incumbent(int max_dives, double time_frac) {
-      std::mt19937 rng(S.o.seed * 2654435761u + 12345u);
+    // Propagation-accelerated restarted randomized diving while there is no incumbent.
+    bool dive_for_incumbent(int max_dives, double time_frac, int seed_offset = 0,
+                            const std::function<bool()>& stay = nullptr) {
+      std::mt19937 rng(S.o.seed * 2654435761u + 12345u + static_cast<unsigned>(seed_offset) * 1000003u);
       std::vector<int> fix, cand;
       const double t0 = S.now();
       const double budget = time_frac * S.o.time_limit;
@@ -632,20 +1005,32 @@ class Search {
         int flips = 0;
         const int max_flips = 10 + 5 * std::min(dive, 40);
         for (;;) {
-          if (S.stop()) return false;
-          if (S.now() - t0 > budget) {
+          if (S.stop()) {
+            undo_probe();
+            switch_to({});
+            return false;
+          }
+          if (S.terminated.load(std::memory_order_relaxed) || S.H.thr() < INF || (stay && !stay()) ||
+              S.now() - t0 > budget) {
+            undo_probe();
             switch_to({});
             return true;
           }
-          switch_to(fix);
-          const LpSolver::Status st = lp->solve();
+          undo_probe();
+          const bool sw_ok = switch_to(fix) && propagate(true);
+          const LpSolver::Status st = sw_ok ? lp->solve() : LpSolver::INFEASIBLE;
           ++S.total_nodes;
-          ++S.R.dive_nodes;
+          S.a_dive_nodes.fetch_add(1, std::memory_order_relaxed);
           if (st != LpSolver::OPTIMAL) {
-            if (st != LpSolver::INFEASIBLE && S.stop()) return false;
+            if (st != LpSolver::INFEASIBLE && S.stop()) {
+              undo_probe();
+              switch_to({});
+              return false;
+            }
             while (!fix.empty() && (fix.back() & 1) == 0) fix.pop_back();
             if (fix.empty()) {
               if (dive == 0 && flips == 0) {
+                undo_probe();
                 switch_to({});
                 return true;
               }
@@ -658,7 +1043,7 @@ class Search {
           lp->get_x(x);
           cand.clear();
           for (int k = 0; k < S.nk; ++k)
-            if (x[k] > FRAC && x[k] < 1.0 - FRAC) cand.push_back(k);
+            if (x[k] > FRAC && x[k] < 1.0 - FRAC && eff[k] == -1) cand.push_back(k);
           if (cand.empty()) {
             offer_integral();
             break;
@@ -666,12 +1051,13 @@ class Search {
           if (S.nonneg && fix.empty()) round_greedy();
           std::partial_sort(cand.begin(), cand.begin() + std::min<size_t>(3, cand.size()), cand.end(),
                             [&](int a, int b) { return x[a] > x[b] || (x[a] == x[b] && a < b); });
-          const unsigned r = dive == 0 ? 0 : rng() % 6;
+          const unsigned r = (dive == 0 && seed_offset == 0) ? 0 : rng() % 6;
           const size_t pick = std::min<size_t>(r < 3 ? 0 : (r < 5 ? 1 : 2), cand.size() - 1);
           fix.push_back(cand[pick] * 2 + 1);
         }
-        ++S.R.dives;
+        S.a_dives.fetch_add(1, std::memory_order_relaxed);
       }
+      undo_probe();
       switch_to({});
       return true;
     }
@@ -767,14 +1153,20 @@ class Search {
           double zc[2];
           for (int v = 0; v < 2; ++v) {
             const long it0 = lp->iterations();
-            lp->set_col_bounds(k, v, v);
+            const bool prop_ok = start_probe(k, v);
+            if (!prop_ok) {
+              zc[v] = INF;
+              undo_probe();
+              lp->restore_state(node_state);
+              continue;
+            }
             const LpSolver::Status st = lp->solve(cut, S.o.strong_iters);
             ++local_strong;
             zc[v] = (st == LpSolver::INFEASIBLE || st == LpSolver::CUTOFF) ? INF
                     : (st == LpSolver::OPTIMAL || st == LpSolver::LIMIT) ? std::max(lp->obj() - S.P.offset, z) : z;
             if (zc[v] < INF && S.round_up(zc[v]) > thr) zc[v] = INF;
             sb_iters += lp->iterations() - it0;
-            lp->set_col_bounds(k, 0.0, 1.0);
+            undo_probe();
             lp->restore_state(node_state);
           }
           if (zc[0] == INF && zc[1] == INF) {
@@ -1005,6 +1397,12 @@ class Search {
           if (is_main && heur_at >= 0 && (total_nodes.load(std::memory_order_relaxed) > heur_at || now() > heur_time)) {
             heur_at = -1;
             if (thr == INF) {
+              if (!exact) {
+                // Restricted column set already ran the concurrent sprint + short tree search without finding
+                // a solution: widen the column set immediately instead of stalling on a small pool.
+                terminate_locked(NO_INCUMBENT);
+                return;
+              }
               active_bound[0] = open.front()->bound;
               ++active_workers;
               lk.unlock();
@@ -1015,10 +1413,6 @@ class Search {
               active_bound[0] = INF;
               if (!ok) {
                 terminate_locked(STOPPED);
-                return;
-              }
-              if (!exact && H.thr() == INF) {
-                terminate_locked(NO_INCUMBENT);
                 return;
               }
               tree_cv.notify_all();
@@ -1073,7 +1467,7 @@ class Search {
           thr = H.thr();
           W.global_fix(thr);
         }
-        W.switch_to(cur.fix);
+        if (!W.switch_to(cur.fix) || !W.propagate(false)) break;
         if (from_queue && cur.basis) W.lp->set_basis(*cur.basis);
         from_queue = false;
         cur.basis.reset();
@@ -1099,10 +1493,14 @@ class Search {
           break;
         }
         if (round_up(z) > thr) break;
-        W.global_fix(thr);
+        if (W.global_fix(thr)) break;
         W.lp->get_x(W.x);
         if (H.lp_point && (nodes_now & 15) == 1) H.lp_point(cols, W.x);
-        if (o.node_fixing && exact && thr < INF) W.local_fix(z, thr);
+        bool tightened = false;
+        if (o.node_fixing && exact && thr < INF && W.local_fix(z, thr)) tightened = true;
+        if (tightened || !W.dirty_rows.empty()) {
+          if (!W.propagate(false)) break;
+        }
         if (o.rins && exact && thr < INF && nodes_now >= rins_at.load(std::memory_order_relaxed) &&
             rins_time_sec() < 0.08 * now() + 0.01 * o.time_limit) {
           if (!rins_busy.exchange(true, std::memory_order_acq_rel)) {
@@ -1113,8 +1511,16 @@ class Search {
           }
         }
         cand.clear();
-        for (int k = 0; k < nk; ++k)
-          if (W.x[k] > FRAC && W.x[k] < 1.0 - FRAC) cand.push_back(k);
+        bool need_resolve = false;
+        for (int k = 0; k < nk; ++k) {
+          if (W.x[k] > FRAC && W.x[k] < 1.0 - FRAC) {
+            if (W.eff[k] != -1) need_resolve = true;
+            else cand.push_back(k);
+          } else if (W.eff[k] != -1 && std::fabs(W.x[k] - static_cast<double>(W.eff[k])) > 1e-6) {
+            need_resolve = true;
+          }
+        }
+        if (need_resolve) continue;
         if (cand.empty()) {
           W.offer_integral();
           break;
@@ -1162,16 +1568,16 @@ class Search {
     for (int k = 0; k < nk; ++k) nnz0 += P.cptr[cols[k] + 1] - P.cptr[cols[k]];
     const long budget = std::max(nnz0, 50000L), longest = std::max(200L, nk / 5L);
     std::vector<int> cut_len;  // nonzeros of the cut rows now in the LP
+    std::vector<char> row_int(P.m, 1);
+    for (int k = 0; k < nk; ++k) {
+      const int j = cols[k];
+      for (int q = P.cptr[j]; q < P.cptr[j + 1]; ++q)
+        if (std::floor(P.cval[q]) != P.cval[q]) row_int[P.cidx[q]] = 0;
+    }
     std::vector<int> ord, rptr, ridx;
-    std::vector<double> rval, rlo, rup;
-    for (int round = 0; round < o.cut_rounds && !stop() && now() < t_end; ++round) {
-      lp0->get_x(x);
-      pool.clear();
-      const int cap = std::max(20, P.m / 4);
-      if (o.cuts & 4) separate_cliques(rows, x, 0.02, cap, pool);
-      if (o.cuts & 1) separate_zero_half(rows, x, true, o.cut_size, 0.02, cap, rng, pool);
-      if (o.cuts & 2) separate_zero_half(rows, x, false, o.cut_size, 0.02, cap, rng, pool);
-      if (pool.size() == 0) break;
+    std::vector<double> rval, rlo, rup, cdense(nk, 0.0), sel_norm;
+    auto select_and_add = [&](int round_cap, long len_lim, double par_tol, bool check_keep_hook) -> bool {
+      if (pool.size() == 0) return false;
       ord.resize(pool.size());
       for (int c = 0; c < pool.size(); ++c) ord[c] = c;
       std::sort(ord.begin(), ord.end(), [&](int a, int b) {
@@ -1182,22 +1588,42 @@ class Search {
       rval.clear();
       rlo.clear();
       rup.clear();
+      sel_norm.clear();
       for (int c : ord) {
         const long len = pool.ptr[c + 1] - pool.ptr[c];
-        if (static_cast<int>(rlo.size()) >= cap) break;
-        if (len > longest || cut_nnz + len > budget) continue;
+        if (static_cast<int>(rlo.size()) >= round_cap) break;
+        if (len > len_lim || cut_nnz + len > budget) continue;
+        const int p0 = pool.ptr[c], p1 = pool.ptr[c + 1];
+        double cn2 = 0.0;
+        for (int q = p0; q < p1; ++q) {
+          cdense[pool.idx[q]] = pool.val[q];
+          cn2 += pool.val[q] * pool.val[q];
+        }
+        const double cnorm = std::sqrt(cn2);
+        bool parallel = false;
+        const int nsel = static_cast<int>(sel_norm.size());
+        for (int s = 0; s < nsel && !parallel; ++s) {
+          double dot = 0.0;
+          for (int q = rptr[s]; q < rptr[s + 1]; ++q) dot += cdense[ridx[q]] * rval[q];
+          if (std::fabs(dot) > par_tol * cnorm * sel_norm[s]) parallel = true;
+        }
+        for (int q = p0; q < p1; ++q) cdense[pool.idx[q]] = 0.0;
+        if (parallel) continue;
+
         cut_nnz += len;
         cut_len.push_back(static_cast<int>(len));
-        ridx.insert(ridx.end(), pool.idx.begin() + pool.ptr[c], pool.idx.begin() + pool.ptr[c + 1]);
-        rval.insert(rval.end(), pool.val.begin() + pool.ptr[c], pool.val.begin() + pool.ptr[c + 1]);
+        row_int.push_back(pool.is_int[c]);
+        sel_norm.push_back(cnorm);
+        ridx.insert(ridx.end(), pool.idx.begin() + p0, pool.idx.begin() + p1);
+        rval.insert(rval.end(), pool.val.begin() + p0, pool.val.begin() + p1);
         rptr.push_back(static_cast<int>(ridx.size()));
         rlo.push_back(pool.lo[c]);
         rup.push_back(pool.up[c]);
       }
-      if (rlo.empty()) break;
+      if (rlo.empty()) return false;
       lp0->add_rows(rptr, ridx, rval, rlo, rup);
       ++R.cut_rounds;
-      if (lp0->solve(INF) != LpSolver::OPTIMAL) break;
+      if (lp0->solve(INF) != LpSolver::OPTIMAL) return false;
       const double zn = lp0->obj() - P.offset;
       const std::vector<char> rs = lp0->row_status();
       std::vector<int> loose;
@@ -1207,22 +1633,78 @@ class Search {
         for (size_t a = loose.size(); a-- > 0;) {
           cut_nnz -= cut_len[loose[a] - P.m];
           cut_len.erase(cut_len.begin() + (loose[a] - P.m));
+          row_int.erase(row_int.begin() + loose[a]);
         }
         lp0->remove_rows(loose);
-        if (lp0->solve(INF) != LpSolver::OPTIMAL) break;
+        if (lp0->solve(INF) != LpSolver::OPTIMAL) return false;
       }
       stall = zn - z < 1e-5 * std::max(1.0, std::fabs(z)) ? stall + 1 : 0;
       z = zn;
-      if (stall >= 3 || round_up(z) > H.thr()) break;
-      if (H.keep && !check_keep(z)) {
+      if (check_keep_hook && H.keep && !check_keep(z)) {
         kept = false;
-        break;
+        return false;
+      }
+      return true;
+    };
+
+    // Phase 1: combinatorial cuts (cliques + zero-half).
+    if (o.cuts & 7) {
+      for (int round = 0; round < o.cut_rounds && !stop() && now() < t_end; ++round) {
+        lp0->get_x(x);
+        pool.clear();
+        const int cap = std::max(20, P.m / 4);
+        if (o.cuts & 4) separate_cliques(rows, x, 0.02, cap, pool);
+        if (o.cuts & 1) separate_zero_half(rows, x, true, o.cut_size, 0.02, cap, rng, pool);
+        if (o.cuts & 2) separate_zero_half(rows, x, false, o.cut_size, 0.02, cap, rng, pool);
+        if (!select_and_add(cap, longest, 0.98, true)) break;
+        if (stall >= 3 || round_up(z) > H.thr()) break;
       }
     }
+
+    // Phase 2: Gomory mixed-integer (GMI) cuts after combinatorial cuts stall, with self-verifying rollback
+    // if the added fill-in does not close enough remaining gap.
+    if (kept && (o.cuts & 8) && !stop() && now() < t_end && round_up(z) <= H.thr()) {
+      const int rows_before = lp0->rows();
+      const double z_before = z;
+      const long nnz_before = cut_nnz;
+      const long gmi_longest = std::min<long>(nk, 1200L);
+      const int gmi_cap = std::min(std::max(15, P.m / 6), 25);
+      stall = 0;
+      for (int gr = 0; gr < 4 && !stop() && now() < t_end; ++gr) {
+        lp0->get_x(x);
+        pool.clear();
+        if (separate_gmi(*lp0, row_int, x, 0.005, gmi_cap, static_cast<int>(gmi_longest), pool) == 0) break;
+        if (!select_and_add(gmi_cap, gmi_longest, 0.95, true)) break;
+        if (stall >= 2 || round_up(z) > H.thr()) break;
+      }
+      if (kept && lp0->rows() > rows_before) {
+        const double thr_g = H.thr();
+        const long gmi_nnz = std::max(0L, cut_nnz - nnz_before);
+        const double closed = z - z_before;
+        bool drop_gmi = false;
+        if (thr_g < INF) {
+          const double rem_gap = std::max(1e-9, thr_g - z_before);
+          const double req = std::max(0.02, 0.10 * static_cast<double>(gmi_nnz) / std::max(10000L, nnz0));
+          if (closed < req * rem_gap) drop_gmi = true;
+          if (o.integral && round_up(z) == round_up(z_before) && closed < 0.10 * rem_gap) drop_gmi = true;
+        } else {
+          if (closed < 1e-3 * std::max(1.0, std::fabs(z_before))) drop_gmi = true;
+        }
+        if (drop_gmi) {
+          lp0->remove_rows(rows_before);
+          cut_len.resize(static_cast<size_t>(rows_before - P.m));
+          row_int.resize(static_cast<size_t>(rows_before));
+          cut_nnz = nnz_before;
+          if (lp0->solve(INF) == LpSolver::OPTIMAL) z = lp0->obj() - P.offset;
+        }
+      }
+    }
+
     // Cuts that close little of the gap relative to the fill-in they add only slow every node LP down.
     const double thr_now = H.thr();
     const double min_close =
-        (o.cuts == 1 && o.integral) ? std::max(0.05, 0.25 * static_cast<double>(cut_nnz) / std::max(1L, nnz0)) : 0.05;
+        ((o.cuts & 6) == 0 && o.integral) ? std::max(0.05, 0.25 * static_cast<double>(cut_nnz) / std::max(1L, nnz0))
+                                          : 0.05;
     if (kept && lp0->rows() > P.m && thr_now < INF && z - zr0 < min_close * (thr_now - zr0)) lp0->remove_rows(P.m);
     R.cuts = lp0->rows() - P.m;
     R.cut_time += now() - t_begin;
