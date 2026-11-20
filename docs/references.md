@@ -69,7 +69,7 @@ BKS 대조에서 나온 사실:
 | 부가 제약(≤)을 승수 v ≥ 0으로 함께 완화, greedy·탐색에서 남은 용량 확인 | `sc_solver.cpp` 전반 | 일반 Lagrangian 완화(Beasley 1990의 틀을 ≤ 제약에 적용). 용량 확인은 자체 설계 |
 | reduced-cost fixing(하한 + reduced cost가 개선 기준을 넘으면 열 제거) | `sc_solver.cpp` `apply_rc_fix` | Beasley 1987 |
 | 미커버 행 분기 깊이 우선 탐색, 노드 하한 = 남은 행으로 제한한 Lagrangian 값 | `sc_solver.cpp` `Enum` | Balas & Ho 1980(행 분기), Beasley 1987(Lagrangian 하한 트리 탐색). 승수는 루트 값 고정(노드 재최적화 없음) |
-| local search: 열 하나 추가 후 중복이 된 열 제거(1-추가/다중 제거) | `sc_solver.cpp` `improve` | Yagiura, Kishida & Ibaraki 2006의 flip 이웃 중 일부만 구현(3-flip, 벌점 가중은 미구현) |
+| local search: 열 하나 추가 후 중복 제거(1-추가/다중 제거) + 축소 행 후보 목록 기반 1-제거/{1,2}-추가(2/3-flip) + 동적 행 가중치 타부 탐색 | `sc_solver.cpp` `improve`, `improve_flip`, `wls_step`, `build_rcand` | Yagiura, Kishida & Ibaraki 2006(3-flip 이웃, 축소 후보 목록, 동적 행 가중치 벌점 탐색). 부가 제약(≤)용 `fits_add` 검사 및 `ns == 0` 전담 워커 배분은 자체 구성 |
 | 큰 이웃 탐색: incumbent 일부를 고정하고 나머지를 위 트리 탐색으로 정확히 풀기 | `sc_solver.cpp` `lns_step` | 고정 후 재최적화는 Caprara, Fischetti & Toth 1999의 refinement와 같은 틀. 이웃 선택(무작위 행 주변)과 정확 탐색 결합은 자체 설계 |
 | SC 해 → 분할 해 변환(중복 주문을 절감이 가장 작은 묶음에 남김) | `python/scsp/dms.py` | 사용자의 DMS 코드(HighsSP.py)의 규칙을 그대로 옮김 |
 | 기저 LU 분해: singleton 열·행 우선, Markowitz 수 최소 + 임계 피벗(열 최대값의 0.1배 이상) | `src/core/lu.cpp` `factor` | Markowitz 1957; Suhl & Suhl 1990. 특이 기저는 피벗이 안 된 위치를 logical 열로 바꿔 복구(일반적인 관행) |
@@ -106,8 +106,9 @@ BKS 대조에서 나온 사실:
 | 분기·강분기·reduced-cost 고정 시 정수 비음 행 도메인/충돌 전파(SPP 충돌 열 즉시 0 고정, singleton 행 연쇄 1 고정) | `src/core/bnb.cpp` (`Worker::propagate`, `set_eff`, `start_probe`) | Savelsbergh 1994(전처리·프로빙·영역 전파) |
 | 루트 Gomory Mixed-Integer(GMI) 컷(심플렉스 태블로 행 추출, 정수/연속 슬랙 분리, 안전한 소계수 완화, 직교성 필터, 효과 미달 시 자동 롤백) | `include/scsp/lp.hpp`, `src/core/lp.cpp`(`tableau_row`), `include/scsp/cuts.hpp`, `src/core/cuts.cpp`(`separate_gmi`), `src/core/bnb.cpp`(`root_cuts`) | Balas, Ceria, Cornuéjols & Natraj 1996(GMI 컷·실용 수치 기준). 2단계 분리 및 갭 기반 자동 롤백은 자체 구성 |
 | 루트 컷 전 병렬 첫 해 탐색(전파 가속 diving / 충돌 인식 Objective FP / exact cover 동시 실행), 행 클러스터 LNS(교량 열 연결) 및 비대칭 Local Branching | `src/core/bnb.cpp`(`Search::run`, `dive_for_incumbent`, `feasibility_pump`), `src/core/bin_solver.cpp`(`lns_step`) | Achterberg & Berthold 2007(Objective FP); Fischetti & Lodi 2003(비대칭 Local Branching); Shaw 1998(클러스터 destroy/repair LNS). 병렬 스프린트 스케줄 및 교량 열 확장은 자체 구성 |
+| 대형 SC 2/3-flip 이웃(`1-drop/{1,2}-add`) 및 동적 행 가중치 타부 탐색(`wls_step`), 축소 행 후보 목록(`build_rcand`) | `src/core/sc_solver.cpp` (`build_rcand`, `improve_flip`, `wls_step`, `Worker::pass`) | Yagiura, Kishida & Ibaraki 2006(3-flip 이웃·후보 축소·동적 행 가중치). 순수 SC(`ns == 0`) 전담 워커 배분 및 부가 제약(`ns > 0`) 패스당 1회 2/3-flip 정련은 자체 구성 |
 
-솔버 기법을 구현할 때마다 이 표에 한 줄씩 추가한다(P6 3순위까지 반영, 2026-11-20).
+솔버 기법을 구현할 때마다 이 표에 한 줄씩 추가한다(P6 1~4순위 반영, 2026-11-20).
 
 ## 4. P2~P6에서 추가 인용한 문헌 (Crossref·출판사 기록 대조 완료)
 

@@ -6,8 +6,9 @@
 //     Lagrangian costs, column fixing) and the refinement loop around it.
 //   * Beasley 1987, 1990: Lagrangian lower bound, reduced-cost fixing, tree search
 //     over an uncovered row with Lagrangian bounds; Balas & Ho 1980: row branching.
-//   * Yagiura, Kishida & Ibaraki 2006: flip neighbourhoods for local search. Only the
-//     "add one column, drop what became redundant" move is implemented here.
+//   * Yagiura, Kishida & Ibaraki 2006: 2/3-flip neighbourhoods (1-add/multi-drop,
+//     1-drop/{1,2}-add over reduced row candidate lists) and dynamic row-weight
+//     guided local search.
 // Side constraints (sum a x <= b, a >= 0) get their own multipliers in the
 // relaxation; the greedy, the local search and the enumeration never exceed b.
 #include "scsp/sc_solver.hpp"
@@ -184,6 +185,23 @@ class Worker {
   bool pass() {
     if (S.timeup()) return false;
     const double t_pass = S.elapsed(), ub_pass = S.ub.load();
+    // Worker 2 (typically the ex-B&B thread after giving up on a large unprovable pure-SC tree)
+    // acts as a Yagiura-Kishida-Ibaraki 3-flip + dynamic-row-weight specialist once root candidates
+    // exist, refreshing Lagrangian diversity every 4th pass.
+    const bool wls_specialist =
+        (ns == 0 && id == 2 && pass_no >= 1 && have_root && S.opt.local_search && S.ub.load() < INF && !want_help_tree());
+    if (wls_specialist && (pass_no % 4 != 0)) {
+      unfix_all();
+      apply_rc_fix();
+      wls_step(0.35);
+      if (!S.timeup() && !want_help_tree() && S.opt.enumerate) {
+        const double tl = S.elapsed();
+        while (!S.timeup() && !want_help_tree() && S.elapsed() - tl < 0.08) lns_step();
+      }
+      ++S.passes;
+      ++pass_no;
+      return !S.timeup();
+    }
     pass_cost = INF;
     pass_best.clear();
     three_phase();
@@ -209,7 +227,33 @@ class Worker {
       }
       const double t0 = S.elapsed();
       const double budget = std::max(0.02, share / (1.0 - share) * (t0 - t_pass));
-      while (!S.timeup() && S.elapsed() - t0 < budget) lns_improved |= lns_step();
+      if (ns == 0 && S.opt.local_search && !want_help_tree() && (wide || n >= 8000 || pass_no >= 2)) {
+        const double wb = (wide || n >= 8000) ? std::min(0.25, std::max(0.06, 0.45 * budget))
+                                              : std::min(0.06, 0.25 * budget);
+        lns_improved |= wls_step(wb);
+      }
+      while (!S.timeup() && !want_help_tree() && S.elapsed() - t0 < budget) lns_improved |= lns_step();
+      // For side-constrained SC (ns > 0, e.g. large DMS), polish the incumbent once per pass with exact 2/3-flip
+      // so CFT/LNS throughput stays full speed while still finding 1-drop/{1,2}-add bundle splits/swaps.
+      if (ns > 0 && id == 0 && S.opt.local_search && !S.timeup() && !want_help_tree() && !rc_col.empty()) {
+        std::vector<int> best_snap;
+        {
+          std::lock_guard<std::mutex> g(S.mu);
+          best_snap = S.best;
+        }
+        if (!best_snap.empty()) {
+          load(best_snap, {});
+          long long fmv = 0;
+          if (improve_flip(fmv)) {
+            S.ls_moves += fmv;
+            if (side_ok()) {
+              keep_current();
+              lns_improved = true;
+            }
+          }
+          unload();
+        }
+      }
       if (S.timeup()) return false;
       if (lns_improved && !cft_improved) share = std::min(0.9, share + 0.1);
       if (cft_improved && !lns_improved) share = std::max(0.1, share - 0.1);
@@ -269,6 +313,16 @@ class Worker {
   std::vector<char> insol;
   std::vector<double> usage;
   double cur_cost = 0.0;
+
+  // reduced row candidate lists & 3-flip / dynamic-row-weight state (Yagiura, Kishida & Ibaraki 2006)
+  std::vector<int> rc_ptr, rc_col, urows;
+  std::vector<char> umark;
+  std::vector<double> min_row_cost;
+  std::vector<double> rw, rw_base, p_loss, p_gain, red_loss;
+  std::vector<int> unc_list, unc_pos, cand_k, w_cov, w_tabu;
+  std::vector<char> cand_mark;
+  int wls_clock = 0;
+  int dead_cnt = 0, rcand_dead_cnt = -1;
 
   double pi_min() const { return 0.3 + 0.1 * (id % 3); }
   double rnd() { return std::uniform_real_distribution<double>(0.0, 1.0)(rng); }
@@ -659,55 +713,283 @@ class Worker {
       if (usage[t] > P.side_rhs[t] + 1e-9) return false;
     return true;
   }
+  bool fits_add(int k) const {
+    for (int q = P.cs_ptr[k]; q < P.cs_ptr[k + 1]; ++q)
+      if (usage[P.cs_row[q]] + P.cs_val[q] > P.side_rhs[P.cs_row[q]] + 1e-9) return false;
+    return true;
+  }
 
-  // Local search on the loaded solution: add one column, then drop every column
-  // that became redundant (most expensive first); keep the move if the cost drops.
-  void improve() {
-    bool improved = true;
-    long long moves = 0;
-    for (int pass = 0; improved && pass < 30 && !S.timeup(); ++pass) {
-      improved = false;
-      for (int k : ls_cand) {
-        if (insol[k] || dead[k]) continue;
-        touched.clear();
-        for (int q = P.col_ptr[k]; q < P.col_ptr[k + 1]; ++q) {
-          const int i = P.col_row[q];
-          if (cnt[i] == 1) {
-            const int j = static_cast<int>(sumid[i]);
-            if (dec[j]++ == 0) touched.push_back(j);
+  // Reduced per-row candidate lists (top reduced-cost + cheapest columns per row, sorted by cost)
+  // for fast 2-flip / 3-flip search and dynamic-row-weight local search (Yagiura, Kishida & Ibaraki 2006).
+  void build_rcand() {
+    rc_ptr.assign(m + 1, 0);
+    rc_col.clear();
+    min_row_cost.assign(m, INF);
+    const int K_RC = ns == 0 ? 32 : 20;
+    const int K_COST = ns == 0 ? 12 : 8;
+    std::vector<int> row_rc, row_c;
+    row_rc.reserve(64);
+    row_c.reserve(32);
+    for (int i = 0; i < m; ++i) {
+      row_rc.clear();
+      row_c.clear();
+      double mc = INF;
+      for (int q = P.row_ptr[i]; q < P.row_ptr[i + 1]; ++q) {
+        const int j = P.row_col[q];
+        if (dead[j] || rc_root[j] == INF) continue;
+        if (P.cost[j] < mc) mc = P.cost[j];
+        row_rc.push_back(j);
+      }
+      min_row_cost[i] = mc < INF ? mc : 1.0;
+      const int nr = static_cast<int>(row_rc.size());
+      if (nr > K_RC + K_COST) {
+        row_c = row_rc;
+        std::nth_element(row_rc.begin(), row_rc.begin() + K_RC, row_rc.end(), [&](int a, int b) {
+          return rc_root[a] < rc_root[b] || (rc_root[a] == rc_root[b] && P.cost[a] < P.cost[b]);
+        });
+        row_rc.resize(K_RC);
+        std::nth_element(row_c.begin(), row_c.begin() + K_COST, row_c.end(), [&](int a, int b) {
+          return P.cost[a] < P.cost[b] || (P.cost[a] == P.cost[b] && rc_root[a] < rc_root[b]);
+        });
+        row_c.resize(K_COST);
+        row_rc.insert(row_rc.end(), row_c.begin(), row_c.end());
+        std::sort(row_rc.begin(), row_rc.end());
+        row_rc.erase(std::unique(row_rc.begin(), row_rc.end()), row_rc.end());
+      }
+      std::sort(row_rc.begin(), row_rc.end(), [&](int a, int b) {
+        if (P.cost[a] != P.cost[b]) return P.cost[a] < P.cost[b];
+        if (rc_root[a] != rc_root[b]) return rc_root[a] < rc_root[b];
+        return a < b;
+      });
+      rc_col.insert(rc_col.end(), row_rc.begin(), row_rc.end());
+      rc_ptr[i + 1] = static_cast<int>(rc_col.size());
+    }
+  }
+
+  // Exact feasible 1-drop + {1,2}-add + drop-redundant pass (2-flip & 3-flip, Yagiura et al. 2006).
+  bool improve_flip(long long& moves) {
+    if (rc_col.empty()) return false;
+    if (umark.empty()) umark.assign(m, 0);
+    compact_cur();
+    std::vector<int> order = cur;
+    std::sort(order.begin(), order.end(), [&](int a, int b) { return P.cost[a] > P.cost[b] || (P.cost[a] == P.cost[b] && a < b); });
+    bool improved = false;
+    std::vector<int> dropped;
+    for (int j : order) {
+      if (S.timeup()) break;
+      if (!insol[j]) continue;
+      if (uniq[j] == 0) {
+        remove_col(j);
+        improved = true;
+        ++moves;
+        continue;
+      }
+      const double before = cur_cost;
+      const double cj = P.cost[j];
+      const double tol = 1e-9 * std::max(1.0, cj);
+      urows.clear();
+      for (int q = P.col_ptr[j]; q < P.col_ptr[j + 1]; ++q) {
+        const int i = P.col_row[q];
+        if (cnt[i] == 1) {
+          urows.push_back(i);
+          umark[i] = 1;
+        }
+      }
+      const int nu = static_cast<int>(urows.size());
+      remove_col(j);
+
+      int i1 = urows[0], len1 = rc_ptr[i1 + 1] - rc_ptr[i1];
+      for (int a = 1; a < nu; ++a) {
+        const int r = urows[a];
+        const int l = rc_ptr[r + 1] - rc_ptr[r];
+        if (l < len1) {
+          len1 = l;
+          i1 = r;
+        }
+      }
+
+      int bk1 = -1, bk2 = -1;
+      double best_gain = tol;
+      for (int q1 = rc_ptr[i1]; q1 < rc_ptr[i1 + 1]; ++q1) {
+        const int k1 = rc_col[q1];
+        const double c1 = P.cost[k1];
+        if (c1 > cj + tol) break;
+        if (k1 == j || insol[k1] || dead[k1] || !fits_add(k1)) continue;
+        int cov1 = 0;
+        for (int s = P.col_ptr[k1]; s < P.col_ptr[k1 + 1]; ++s)
+          if (umark[P.col_row[s]] == 1) ++cov1;
+        if (cov1 == nu) {
+          double gain = cj - c1;
+          if (gain <= best_gain) {
+            touched.clear();
+            for (int s = P.col_ptr[k1]; s < P.col_ptr[k1 + 1]; ++s) {
+              const int r = P.col_row[s];
+              if (cnt[r] == 1) {
+                const int u0 = static_cast<int>(sumid[r]);
+                if (dec[u0]++ == 0) touched.push_back(u0);
+              }
+            }
+            double extra = 0.0;
+            for (int u0 : touched) {
+              if (dec[u0] == uniq[u0]) extra += P.cost[u0];
+              dec[u0] = 0;
+            }
+            gain += extra;
+          }
+          if (gain > best_gain) {
+            best_gain = gain;
+            bk1 = k1;
+            bk2 = -1;
+          }
+          continue;
+        }
+        // 3-flip: 1-drop (j) + 2-add (k1, k2)
+        if (c1 >= cj - tol) continue;
+        for (int s = P.col_ptr[k1]; s < P.col_ptr[k1 + 1]; ++s)
+          if (umark[P.col_row[s]] == 1) umark[P.col_row[s]] = 2;
+        int i2 = -1, len2 = INT_MAX;
+        const int rem = nu - cov1;
+        for (int r : urows) {
+          if (umark[r] != 1) continue;
+          const int l = rc_ptr[r + 1] - rc_ptr[r];
+          if (l < len2) {
+            len2 = l;
+            i2 = r;
           }
         }
-        if (touched.empty()) continue;
-        removable.clear();
-        double sum = 0.0;
-        for (int j : touched) {
-          if (dec[j] == uniq[j]) {
-            removable.push_back(j);
-            sum += P.cost[j];
+        if (i2 >= 0) {
+          for (int s = P.cs_ptr[k1]; s < P.cs_ptr[k1 + 1]; ++s) usage[P.cs_row[s]] += P.cs_val[s];
+          for (int q2 = rc_ptr[i2]; q2 < rc_ptr[i2 + 1]; ++q2) {
+            const int k2 = rc_col[q2];
+            const double c12 = c1 + P.cost[k2];
+            if (c12 > cj + tol) break;
+            if (k2 == j || k2 == k1 || insol[k2] || dead[k2] || !fits_add(k2)) continue;
+            int cov2 = 0;
+            for (int s = P.col_ptr[k2]; s < P.col_ptr[k2 + 1]; ++s)
+              if (umark[P.col_row[s]] == 1) ++cov2;
+            if (cov2 == rem) {
+              double gain = cj - c12;
+              if (gain <= best_gain && c12 <= cj + tol) {
+                touched.clear();
+                for (int kk : {k1, k2}) {
+                  for (int s = P.col_ptr[kk]; s < P.col_ptr[kk + 1]; ++s) {
+                    const int r = P.col_row[s];
+                    if (cnt[r] == 1) {
+                      const int u0 = static_cast<int>(sumid[r]);
+                      if (dec[u0]++ == 0) touched.push_back(u0);
+                    }
+                  }
+                }
+                double extra = 0.0;
+                for (int u0 : touched) {
+                  if (dec[u0] >= uniq[u0]) extra += P.cost[u0];
+                  dec[u0] = 0;
+                }
+                gain += extra;
+              }
+              if (gain > best_gain) {
+                best_gain = gain;
+                bk1 = k1;
+                bk2 = k2;
+              }
+            }
           }
-          dec[j] = 0;
+          for (int s = P.cs_ptr[k1]; s < P.cs_ptr[k1 + 1]; ++s) usage[P.cs_row[s]] -= P.cs_val[s];
         }
-        const double ck = P.cost[k];
-        if (sum <= ck + 1e-9 * std::max(1.0, ck)) continue;
-        std::sort(removable.begin(), removable.end(), [&](int a, int b) { return P.cost[a] > P.cost[b]; });
-        const double before = cur_cost;
-        add_col(k);
-        size_t nrem = 0;
-        for (int j : removable)
-          if (uniq[j] == 0) {
-            remove_col(j);
-            removable[nrem++] = j;
+        for (int s = P.col_ptr[k1]; s < P.col_ptr[k1 + 1]; ++s)
+          if (umark[P.col_row[s]] == 2) umark[P.col_row[s]] = 1;
+      }
+      for (int r : urows) umark[r] = 0;
+
+      if (bk1 >= 0) {
+        add_col(bk1);
+        if (bk2 >= 0) add_col(bk2);
+        dropped.clear();
+        for (int x : cur)
+          if (insol[x] && x != bk1 && x != bk2 && uniq[x] == 0) dropped.push_back(x);
+        if (dropped.size() > 1) {
+          std::sort(dropped.begin(), dropped.end(), [&](int a, int b) { return P.cost[a] > P.cost[b]; });
+        }
+        size_t nd = 0;
+        for (int x : dropped)
+          if (insol[x] && uniq[x] == 0) {
+            remove_col(x);
+            dropped[nd++] = x;
           }
         if (cur_cost < before - 1e-9 * std::max(1.0, before) && side_ok()) {
-          cur.push_back(k);
+          cur.push_back(bk1);
+          if (bk2 >= 0) cur.push_back(bk2);
           improved = true;
           ++moves;
         } else {
-          for (size_t a = 0; a < nrem; ++a) add_col(removable[a]);
-          remove_col(k);
+          for (size_t a = 0; a < nd; ++a) add_col(dropped[a]);
+          if (bk2 >= 0) remove_col(bk2);
+          remove_col(bk1);
+          add_col(j);
           cur_cost = before;
         }
+      } else {
+        add_col(j);
       }
+    }
+    if (improved) compact_cur();
+    return improved;
+  }
+
+  // Local search on the loaded solution: 1-add/multi-drop + 1-drop/{1,2}-add (2/3-flip).
+  void improve(bool do_flip = true) {
+    bool improved = true;
+    long long moves = 0;
+    const int max_outer = (ns > 0) ? 4 : 10;
+    for (int outer = 0; improved && outer < max_outer && !S.timeup(); ++outer) {
+      improved = false;
+      bool imp1 = true;
+      for (int pass = 0; imp1 && pass < 20 && !S.timeup(); ++pass) {
+        imp1 = false;
+        for (int k : ls_cand) {
+          if (insol[k] || dead[k]) continue;
+          touched.clear();
+          for (int q = P.col_ptr[k]; q < P.col_ptr[k + 1]; ++q) {
+            const int i = P.col_row[q];
+            if (cnt[i] == 1) {
+              const int j = static_cast<int>(sumid[i]);
+              if (dec[j]++ == 0) touched.push_back(j);
+            }
+          }
+          if (touched.empty()) continue;
+          removable.clear();
+          double sum = 0.0;
+          for (int j : touched) {
+            if (dec[j] == uniq[j]) {
+              removable.push_back(j);
+              sum += P.cost[j];
+            }
+            dec[j] = 0;
+          }
+          const double ck = P.cost[k];
+          if (sum <= ck + 1e-9 * std::max(1.0, ck)) continue;
+          std::sort(removable.begin(), removable.end(), [&](int a, int b) { return P.cost[a] > P.cost[b]; });
+          const double before = cur_cost;
+          add_col(k);
+          size_t nrem = 0;
+          for (int j : removable)
+            if (uniq[j] == 0) {
+              remove_col(j);
+              removable[nrem++] = j;
+            }
+          if (cur_cost < before - 1e-9 * std::max(1.0, before) && side_ok()) {
+            cur.push_back(k);
+            imp1 = true;
+            improved = true;
+            ++moves;
+          } else {
+            for (size_t a = 0; a < nrem; ++a) add_col(removable[a]);
+            remove_col(k);
+            cur_cost = before;
+          }
+        }
+      }
+      if (do_flip && !S.timeup() && improve_flip(moves)) improved = true;
     }
     S.ls_moves += moves;
     compact_cur();
@@ -720,7 +1002,9 @@ class Worker {
     const double ubn = S.ub.load(std::memory_order_relaxed);
     if (ubn == INF || cur_cost < est_ub) est_ub = std::min(est_ub, cur_cost);
     const double refc = explorer && pass_cost < INF ? std::max(ubn, pass_cost) : ubn;
-    if (S.opt.local_search && have_root && (refc == INF || cur_cost <= refc * 1.01 + 1e-9)) improve();
+    if (S.opt.local_search && have_root && (refc == INF || cur_cost <= refc * 1.01 + 1e-9)) {
+      improve(ns == 0);
+    }
     keep_current();
     unload();
   }
@@ -814,14 +1098,20 @@ class Worker {
         if (!dead[j] && ((rc_root[j] > 0 && lb_root + rc_root[j] > thr) ||
                          (lp_adopted && S.lp_rc[j] > 0 && S.lp_bound + S.lp_rc[j] > thr))) {
           dead[j] = 1;
+          ++dead_cnt;
           changed = true;
         }
-    if (!changed && !ls_cand.empty()) return false;
+    if (!changed && !ls_cand.empty() && !rc_col.empty()) return false;
     ls_cand.clear();
     for (int j = 0; j < n; ++j)
       if (!dead[j] && rc_root[j] < INF) ls_cand.push_back(j);
     std::sort(ls_cand.begin(), ls_cand.end(), [&](int a, int b) { return rc_root[a] < rc_root[b] || (rc_root[a] == rc_root[b] && a < b); });
     if (ls_cand.size() > 60000) ls_cand.resize(60000);
+    const int alive_prev = std::max(1, n - std::max(0, rcand_dead_cnt));
+    if (rc_col.empty() || rcand_dead_cnt < 0 || (dead_cnt - rcand_dead_cnt) * 10 >= alive_prev) {
+      build_rcand();
+      rcand_dead_cnt = dead_cnt;
+    }
     return changed;
   }
 
@@ -1067,7 +1357,7 @@ class Worker {
   void finish_solution(const std::vector<int>& cols) {
     load(cols, {});
     drop_redundant();
-    if (S.opt.local_search) improve();
+    if (S.opt.local_search) improve(ns == 0);
     keep_current();
     unload();
   }
@@ -1221,6 +1511,455 @@ class Worker {
       }
     }
     return S.ub.load() < gub0;
+  }
+
+  // Dynamic row-weight guided 2/3-flip tabu local search (Yagiura, Kishida & Ibaraki 2006).
+  // Allows temporarily uncovered rows penalized by adaptive weights rw[i], while strictly
+  // respecting side constraints (sum a x <= b) and checking S.timeup() / want_help_tree().
+  bool wls_step(double budget_sec) {
+    if (budget_sec <= 0.0 || rc_col.empty() || !have_root) return false;
+    const double gub0 = S.ub.load(std::memory_order_relaxed);
+    if (gub0 == INF) return false;
+
+    const bool use_own = explorer && !own.empty() && own_cost > gub0 && (rnd() < 0.45);
+    if (use_own) {
+      inc = own;
+    } else {
+      std::lock_guard<std::mutex> g(S.mu);
+      inc = S.best;
+    }
+    if (inc.empty()) return false;
+
+    if (static_cast<int>(rw.size()) != m) {
+      rw.assign(m, 1.0);
+      rw_base.assign(m, 1.0);
+      unc_pos.assign(m, -1);
+    }
+    if (static_cast<int>(p_loss.size()) != n) {
+      p_loss.assign(n, 0.0);
+      p_gain.assign(n, 0.0);
+      red_loss.assign(n, 0.0);
+      w_cov.assign(n, 0);
+      w_tabu.assign(n, 0);
+      cand_mark.assign(n, 0);
+    }
+    if (umark.empty()) umark.assign(m, 0);
+    if (wls_clock > 1000000000) {
+      std::fill(w_tabu.begin(), w_tabu.end(), 0);
+      wls_clock = 0;
+    }
+    wls_clock += 100;
+    int step = wls_clock;
+
+    load(inc, {});
+    drop_redundant();
+    if (!side_ok()) {
+      unload();
+      return false;
+    }
+    const double avg_c = std::max(1e-3, cur_cost / std::max(1, static_cast<int>(cur.size())));
+    for (int i = 0; i < m; ++i) {
+      rw_base[i] = std::max(u_root[i], std::max(0.5 * min_row_cost[i], 0.05 * avg_c));
+      rw[i] = rw_base[i] * (0.9 + 0.2 * rnd());
+    }
+    unc_list.clear();
+    double pen_sum = 0.0;
+
+    auto recompute_loss = [&]() {
+      pen_sum = 0.0;
+      for (int i : unc_list) pen_sum += rw[i];
+      for (int j : cur) {
+        if (!insol[j]) continue;
+        double pl = 0.0;
+        for (int q = P.col_ptr[j]; q < P.col_ptr[j + 1]; ++q) {
+          const int i = P.col_row[q];
+          if (cnt[i] == 1) pl += rw[i];
+        }
+        p_loss[j] = pl;
+      }
+    };
+    recompute_loss();
+
+    auto w_add = [&](int k) {
+      insol[k] = 1;
+      cur_cost += P.cost[k];
+      p_loss[k] = 0.0;
+      uniq[k] = 0;
+      for (int q = P.col_ptr[k]; q < P.col_ptr[k + 1]; ++q) {
+        const int i = P.col_row[q];
+        if (cnt[i] == 0) {
+          const int pos = unc_pos[i];
+          if (pos >= 0) {
+            const int last = unc_list.back();
+            unc_list[static_cast<size_t>(pos)] = last;
+            unc_pos[last] = pos;
+            unc_list.pop_back();
+            unc_pos[i] = -1;
+          }
+          pen_sum -= rw[i];
+          p_loss[k] += rw[i];
+          ++uniq[k];
+        } else if (cnt[i] == 1) {
+          const int u0 = static_cast<int>(sumid[i]);
+          --uniq[u0];
+          p_loss[u0] -= rw[i];
+        }
+        ++cnt[i];
+        sumid[i] += k;
+      }
+      for (int q = P.cs_ptr[k]; q < P.cs_ptr[k + 1]; ++q) usage[P.cs_row[q]] += P.cs_val[q];
+      cur.push_back(k);
+    };
+
+    auto w_rem = [&](int j) {
+      insol[j] = 0;
+      cur_cost -= P.cost[j];
+      for (int q = P.col_ptr[j]; q < P.col_ptr[j + 1]; ++q) {
+        const int i = P.col_row[q];
+        --cnt[i];
+        sumid[i] -= j;
+        if (cnt[i] == 0) {
+          unc_pos[i] = static_cast<int>(unc_list.size());
+          unc_list.push_back(i);
+          pen_sum += rw[i];
+          --uniq[j];
+          p_loss[j] -= rw[i];
+        } else if (cnt[i] == 1) {
+          const int u0 = static_cast<int>(sumid[i]);
+          ++uniq[u0];
+          p_loss[u0] += rw[i];
+        }
+      }
+      p_loss[j] = 0.0;
+      for (int q = P.cs_ptr[j]; q < P.cs_ptr[j + 1]; ++q) usage[P.cs_row[q]] -= P.cs_val[q];
+    };
+
+    const double t_end = S.elapsed() + budget_sec;
+    double best_here = cur_cost;
+    int weight_updates = 0;
+    int stall_w = 0;
+    long long moves = 0;
+    std::vector<int> sel_rows, drops, best_drops, fb_drops, kick_cand;
+
+    for (int iter = 0; iter < 12000; ++iter) {
+      if ((iter & 31) == 0 && (S.timeup() || want_help_tree() || S.elapsed() >= t_end)) break;
+      ++step;
+      if ((iter & 127) == 127) compact_cur();
+
+      // Remove any column that became redundant (strict cost reduction, zero penalty).
+      for (size_t a = 0; a < cur.size(); ++a) {
+        const int j = cur[a];
+        if (insol[j] && uniq[j] == 0) {
+          w_rem(j);
+          ++moves;
+        }
+      }
+
+      if (unc_list.empty()) {
+        if (side_ok()) {
+          const double ref_ub = use_own ? std::min(own_cost, S.ub.load(std::memory_order_relaxed))
+                                        : S.ub.load(std::memory_order_relaxed);
+          if (cur_cost < best_here - 1e-9 * std::max(1.0, best_here) ||
+              cur_cost < ref_ub - 1e-9 * std::max(1.0, ref_ub)) {
+            improve();
+            if (side_ok()) keep_current();
+            if (cur_cost < best_here) best_here = cur_cost;
+            recompute_loss();
+            stall_w = 0;
+          }
+        }
+        if (weight_updates >= 5) {
+          for (int i = 0; i < m; ++i) rw[i] = 0.85 * rw[i] + 0.15 * rw_base[i];
+          recompute_loss();
+          weight_updates = 0;
+        }
+        // Escape kick: remove 1 or 2 expensive / low-penalty-loss columns to search below current UB.
+        compact_cur();
+        if (cur.empty()) break;
+        kick_cand.clear();
+        for (int j : cur)
+          if (insol[j] && w_tabu[j] <= step) kick_cand.push_back(j);
+        if (kick_cand.empty()) kick_cand = cur;
+        std::sort(kick_cand.begin(), kick_cand.end(), [&](int a, int b) {
+          const double sa = P.cost[a] - p_loss[a], sb = P.cost[b] - p_loss[b];
+          return sa > sb || (sa == sb && P.cost[a] > P.cost[b]);
+        });
+        const int nkick = (stall_w % 3 == 2 && cur.size() > 2) ? 2 : 1;
+        for (int kk = 0; kk < nkick && !kick_cand.empty(); ++kk) {
+          const int pool_sz = std::min<int>(static_cast<int>(kick_cand.size()), 6);
+          const int pick_idx = static_cast<int>(rng() % static_cast<unsigned long long>(pool_sz));
+          const int j = kick_cand[static_cast<size_t>(pick_idx)];
+          kick_cand.erase(kick_cand.begin() + pick_idx);
+          if (insol[j]) {
+            w_rem(j);
+            w_tabu[j] = step + 4 + static_cast<int>(rng() % 6ULL);
+          }
+        }
+        ++stall_w;
+        continue;
+      }
+
+      // Direct 2-add completion check when few rows are uncovered and cur_cost < target UB.
+      const double tgt_ub = use_own ? own_cost : S.ub.load(std::memory_order_relaxed);
+      const double ub_tol = 1e-9 * std::max(1.0, tgt_ub < INF ? tgt_ub : cur_cost);
+      if (unc_list.size() <= 8 && cur_cost < tgt_ub - ub_tol) {
+        const double rem_budget = tgt_ub - cur_cost;
+        const int nu = static_cast<int>(unc_list.size());
+        int i1 = unc_list[0], len1 = rc_ptr[i1 + 1] - rc_ptr[i1];
+        for (int i : unc_list) {
+          umark[i] = 1;
+          const int l = rc_ptr[i + 1] - rc_ptr[i];
+          if (l < len1) {
+            len1 = l;
+            i1 = i;
+          }
+        }
+        int bk1 = -1, bk2 = -1;
+        double best_add_cost = rem_budget - ub_tol;
+        for (int q1 = rc_ptr[i1]; q1 < rc_ptr[i1 + 1]; ++q1) {
+          const int k1 = rc_col[q1];
+          const double c1 = P.cost[k1];
+          if (c1 >= best_add_cost) break;
+          if (insol[k1] || dead[k1] || !fits_add(k1)) continue;
+          int cov1 = 0;
+          for (int s = P.col_ptr[k1]; s < P.col_ptr[k1 + 1]; ++s)
+            if (umark[P.col_row[s]] == 1) ++cov1;
+          if (cov1 == nu) {
+            best_add_cost = c1;
+            bk1 = k1;
+            bk2 = -1;
+            continue;
+          }
+          for (int s = P.col_ptr[k1]; s < P.col_ptr[k1 + 1]; ++s)
+            if (umark[P.col_row[s]] == 1) umark[P.col_row[s]] = 2;
+          int i2 = -1, len2 = INT_MAX;
+          const int rem = nu - cov1;
+          for (int i : unc_list) {
+            if (umark[i] != 1) continue;
+            const int l = rc_ptr[i + 1] - rc_ptr[i];
+            if (l < len2) {
+              len2 = l;
+              i2 = i;
+            }
+          }
+          if (i2 >= 0) {
+            for (int s = P.cs_ptr[k1]; s < P.cs_ptr[k1 + 1]; ++s) usage[P.cs_row[s]] += P.cs_val[s];
+            for (int q2 = rc_ptr[i2]; q2 < rc_ptr[i2 + 1]; ++q2) {
+              const int k2 = rc_col[q2];
+              const double c12 = c1 + P.cost[k2];
+              if (c12 >= best_add_cost) break;
+              if (k2 == k1 || insol[k2] || dead[k2] || !fits_add(k2)) continue;
+              int cov2 = 0;
+              for (int s = P.col_ptr[k2]; s < P.col_ptr[k2 + 1]; ++s)
+                if (umark[P.col_row[s]] == 1) ++cov2;
+              if (cov2 == rem) {
+                best_add_cost = c12;
+                bk1 = k1;
+                bk2 = k2;
+              }
+            }
+            for (int s = P.cs_ptr[k1]; s < P.cs_ptr[k1 + 1]; ++s) usage[P.cs_row[s]] -= P.cs_val[s];
+          }
+          for (int s = P.col_ptr[k1]; s < P.col_ptr[k1 + 1]; ++s)
+            if (umark[P.col_row[s]] == 2) umark[P.col_row[s]] = 1;
+        }
+        for (int i : unc_list) umark[i] = 0;
+        if (bk1 >= 0) {
+          w_add(bk1);
+          if (bk2 >= 0) w_add(bk2);
+          ++moves;
+          continue;
+        }
+      }
+
+      // Gather candidate add columns touching uncovered rows.
+      sel_rows.clear();
+      if (unc_list.size() <= 24) {
+        sel_rows = unc_list;
+      } else {
+        sel_rows = unc_list;
+        std::nth_element(sel_rows.begin(), sel_rows.begin() + 20, sel_rows.end(),
+                         [&](int a, int b) { return rw[a] > rw[b]; });
+        sel_rows.resize(20);
+      }
+      cand_k.clear();
+      for (int i : sel_rows) {
+        const double wi = rw[i];
+        for (int q = rc_ptr[i]; q < rc_ptr[i + 1]; ++q) {
+          const int k = rc_col[q];
+          if (insol[k] || dead[k]) continue;
+          if (!cand_mark[k]) {
+            cand_mark[k] = 1;
+            p_gain[k] = wi;
+            w_cov[k] = 1;
+            cand_k.push_back(k);
+          } else {
+            p_gain[k] += wi;
+            ++w_cov[k];
+          }
+        }
+      }
+
+      // Evaluate 1-add, compound (1-add + multi-drop), and 1-remove moves under f = cur_cost + pen_sum.
+      const double f_tol = 1e-9 * std::max(1.0, cur_cost + pen_sum);
+      int best_type = 0;  // 1: add (+ drops), 2: pure rem
+      int best_col = -1;
+      double best_delta = -f_tol;
+      best_drops.clear();
+
+      int fb_col = -1;
+      double fb_delta = INF;
+      fb_drops.clear();
+
+      const int nu_all = static_cast<int>(unc_list.size());
+      for (int k : cand_k) {
+        const bool tabu_k = w_tabu[k] > step;
+        touched.clear();
+        for (int q = P.col_ptr[k]; q < P.col_ptr[k + 1]; ++q) {
+          const int i = P.col_row[q];
+          if (cnt[i] == 1) {
+            const int j = static_cast<int>(sumid[i]);
+            if (dec[j]++ == 0) {
+              touched.push_back(j);
+              red_loss[j] = rw[i];
+            } else {
+              red_loss[j] += rw[i];
+            }
+          }
+        }
+        drops.clear();
+        double drop_delta = 0.0;
+        double red_cost_drop = 0.0;
+        for (int j : touched) {
+          const double rem_pen = std::max(0.0, p_loss[j] - red_loss[j]);
+          const bool fully_red = dec[j] == uniq[j];
+          const double dj = rem_pen - P.cost[j];
+          if (dj < -f_tol && (fully_red || w_tabu[j] <= step)) {
+            drops.push_back(j);
+            drop_delta += dj;
+            if (fully_red) red_cost_drop += P.cost[j];
+          }
+          dec[j] = 0;
+          red_loss[j] = 0.0;
+        }
+        bool ok_side = fits_add(k);
+        if (!ok_side && !drops.empty() && ns > 0) {
+          for (int j : drops)
+            for (int q = P.cs_ptr[j]; q < P.cs_ptr[j + 1]; ++q) usage[P.cs_row[q]] -= P.cs_val[q];
+          ok_side = fits_add(k);
+          for (int j : drops)
+            for (int q = P.cs_ptr[j]; q < P.cs_ptr[j + 1]; ++q) usage[P.cs_row[q]] += P.cs_val[q];
+        }
+        if (!ok_side) continue;
+
+        const double delta = (P.cost[k] - p_gain[k]) + drop_delta;
+        const bool aspire =
+            (w_cov[k] == nu_all) && (cur_cost + P.cost[k] - red_cost_drop < tgt_ub - ub_tol);
+        if ((!tabu_k || aspire) && delta < best_delta) {
+          best_delta = delta;
+          best_type = 1;
+          best_col = k;
+          best_drops = drops;
+        }
+        if (!tabu_k && delta < fb_delta) {
+          fb_delta = delta;
+          fb_col = k;
+          fb_drops = drops;
+        }
+      }
+      for (int k : cand_k) {
+        cand_mark[k] = 0;
+        p_gain[k] = 0.0;
+        w_cov[k] = 0;
+      }
+
+      // Pure 1-remove move.
+      for (int j : cur) {
+        if (!insol[j] || w_tabu[j] > step) continue;
+        const double dj = p_loss[j] - P.cost[j];
+        if (dj < best_delta) {
+          best_delta = dj;
+          best_type = 2;
+          best_col = j;
+        }
+      }
+
+      if (best_type == 1) {
+        // Apply compound drops first so side constraints stay valid, then add best_col.
+        std::vector<int> applied_drops;
+        for (int j : best_drops) {
+          if (insol[j]) {
+            w_rem(j);
+            applied_drops.push_back(j);
+          }
+        }
+        if (fits_add(best_col)) {
+          w_add(best_col);
+          const int ten = 3 + static_cast<int>(rng() % 5ULL);
+          w_tabu[best_col] = step + ten;
+          for (int j : applied_drops) w_tabu[j] = step + ten;
+          ++moves;
+        } else {
+          for (int j : applied_drops) w_add(j);
+        }
+      } else if (best_type == 2) {
+        w_rem(best_col);
+        w_tabu[best_col] = step + 3 + static_cast<int>(rng() % 5ULL);
+        ++moves;
+      } else {
+        // Infeasible local minimum: increase weights of uncovered rows (Yagiura et al. 2006)
+        // and take the least-degrading non-tabu move.
+        for (int i : unc_list) {
+          const double dw = std::max(0.25 * rw[i], 0.5 * rw_base[i]);
+          rw[i] = std::min(rw[i] + dw, 100.0 * rw_base[i]);
+        }
+        pen_sum = 0.0;
+        for (int i : unc_list) pen_sum += rw[i];
+        ++weight_updates;
+        ++stall_w;
+        if (weight_updates >= 25) {
+          for (int i = 0; i < m; ++i) rw[i] = 0.80 * rw[i] + 0.20 * rw_base[i];
+          recompute_loss();
+          weight_updates = 0;
+        }
+        if (fb_col >= 0) {
+          std::vector<int> applied_drops;
+          for (int j : fb_drops) {
+            if (insol[j]) {
+              w_rem(j);
+              applied_drops.push_back(j);
+            }
+          }
+          if (fits_add(fb_col)) {
+            w_add(fb_col);
+            const int ten = 3 + static_cast<int>(rng() % 5ULL);
+            w_tabu[fb_col] = step + ten;
+            for (int j : applied_drops) w_tabu[j] = step + ten;
+            ++moves;
+          } else {
+            for (int j : applied_drops) w_add(j);
+          }
+        } else if (!cur.empty()) {
+          // Side-constrained deadlock: drop a random active column to free capacity.
+          compact_cur();
+          if (!cur.empty()) {
+            const int j = cur[static_cast<size_t>(rng() % static_cast<unsigned long long>(cur.size()))];
+            if (insol[j]) {
+              w_rem(j);
+              w_tabu[j] = step + 4;
+            }
+          }
+        }
+      }
+    }
+
+    wls_clock = step + 20;
+    S.ls_moves += moves;
+    for (int i : unc_list) unc_pos[i] = -1;
+    unc_list.clear();
+    for (int j : cur) p_loss[j] = 0.0;
+    unload();
+    return S.ub.load(std::memory_order_relaxed) < gub0;
   }
 };
 
