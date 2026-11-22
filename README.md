@@ -4,7 +4,7 @@
 외부 LP/MIP 라이브러리 없이 **dual/primal simplex · 희소 LU · sifting · 절단평면 · 병렬 Branch-and-Cut · Lagrangian(CFT) 휴리스틱**까지 공개 문헌만 참고해 클린룸 방식으로 직접 구현한 프로젝트입니다.
 
 * **설계 문서**: [docs/design.md](docs/design.md)
-* **단계별 리포트**: [P0 하네스](docs/p0_report.md) · [P1 SC 휴리스틱](docs/p1_report.md) · [P2 LP 엔진](docs/p2_report.md) · [P3 정확해법](docs/p3_report.md) · [P4 B&C 강화](docs/p4_report.md) · [P5 병렬 B&C·최종 리포트](docs/p5_report.md)
+* **단계별 리포트**: [P0 하네스](docs/p0_report.md) · [P1 SC 휴리스틱](docs/p1_report.md) · [P2 LP 엔진](docs/p2_report.md) · [P3 정확해법](docs/p3_report.md) · [P4 B&C 강화](docs/p4_report.md) · [P5 병렬 B&C](docs/p5_report.md) · **[P6 후속 최적화·최종 리포트](docs/p6_report.md)**
 * **참고문헌 및 출처 기록**: [docs/references.md](docs/references.md)
 
 ---
@@ -17,13 +17,13 @@
 $$\min \; c^\top x + \text{offset}$$
 $$\text{s.t.}\quad \sum_{j \in S_i} x_j \; (\ge \mid = \mid \le)\; 1 \quad \forall i, \qquad A_{\text{side}} x \; (\le \mid = \mid \ge)\; b_{\text{side}}, \qquad x \in \{0,1\}^n$$
 
-### 두 갈래 풀이 아키텍처 (P0~P5 완결)
+### 두 갈래 풀이 아키텍처 (P0~P6)
 `scsp.solve()`는 모델 구조에 따라 최적의 C++17 병렬 엔진 경로를 자동 선택합니다.
 
 | 경로 (`stats["path"]`) | 대상 모델 | 핵심 알고리즘 |
 |---|---|---|
-| **`sc`** | 덮기 행(`≥ 1`) + 비음수 계수 `≤` 부가 제약 (OR-Library SCP, Rail, DMS형 모델) | SC 전처리 + **3스레드 Lagrangian(CFT) 휴리스틱·로컬 탐색** + **루트 LP(sifting)·zero-half 컷·병렬 Branch-and-Cut(RINS·노드별 고정)** + 휴리스틱 정체/좁은 gap 시 휴리스틱 스레드 동적 B&B 합류, 대형 미증명 문제 시 트리 조기 반환 |
-| **`bin`** | 분할 행(`= 1`), 묶기 행(`≤ 1`), 일반 부가 제약·음수 비용 포함 (OR-Library SPP, 합성 SP 등) | 분할 전처리(Borndörfer) + **루트 컷(zero-half · odd-hole · clique)** + **병렬 Branch-and-Cut** + **gap 기반 동적 병렬 LNS/RINS** (넓은 gap에서는 3 LNS, 좁은 gap에서는 최대 4스레드 병렬 B&B) |
+| **`sc`** | 덮기 행(`≥ 1`) + 비음수 계수 `≤` 부가 제약 (OR-Library SCP, Rail, DMS형 모델) | SC 전처리 + **3스레드 Lagrangian(CFT) 휴리스틱 · 2/3-flip & 동적 행 가중치 타부 탐색(Yagiura et al. 2006)** + **hypersparse 루트 LP(sifting) · zero-half/GMI 컷 · 도메인 전파 병렬 Branch-and-Cut(RINS·노드별 고정)** + 휴리스틱 정체/좁은 gap 시 동적 B&B 합류, 대형 미증명 문제 시 트리 조기 반환 |
+| **`bin`** | 분할 행(`= 1`), 묶기 행(`≤ 1`), 일반 부가 제약·음수 비용 포함 (OR-Library SPP, 합성 SP 등) | 분할 전처리(Borndörfer) + **루트 컷 전 4스레드 병렬 첫 해 스프린트(전파 diving / Objective FP / exact cover)** + **루트 컷(zero-half · odd-hole · clique · GMI)** + **도메인/충돌 전파 병렬 Branch-and-Cut** + **행 클러스터 LNS · 비대칭 Local Branching · RINS** |
 
 ### 클린룸 규칙
 * SCIP, CBC/CLP, HiGHS, CP-SAT, GLPK, lp_solve 등 다른 솔버의 **소스 코드는 일절 열람하지 않았습니다.**
@@ -32,7 +32,7 @@ $$\text{s.t.}\quad \sum_{j \in S_i} x_j \; (\ge \mid = \mid \le)\; 1 \quad \fora
 
 ---
 
-## 2. 벤치마크 요약 (P5 최종 게이트)
+## 2. 벤치마크 요약 (P6 최종 게이트)
 
 ### 벤치마크 구성 및 조건
 * **환경**: Apple M4, **모든 솔버 4스레드**, 제한 시간 **30초** (기준 솔버 HiGHS·Gurobi는 60초 실행 후 trace에서 5·10·30초 값 추출), 프로세스당 1회 순차 실행.
@@ -42,32 +42,38 @@ $$\text{s.t.}\quad \sum_{j \in S_i} x_j \; (\ge \mid = \mid \le)\; 1 \quad \fora
   * **총 621회 실행**(기본 3 seed, 변동 큰 세트 5 seed, DMS warm start `near`/`indep` 각 3 seed) 전량 독립 검증 통과(**미검증 0건 · 하한 초과 0건 · 최적값 불일치 0건**).
 * **Gurobi 비교 범위**: 크기 제한 라이선스 조건(원래 모델 기준 변수 ≤ 2,000 및 제약 ≤ 2,000)에 해당하는 **71개**(SC 40, SPP 31).
 
-### 핵심 결과 (P5 vs HiGHS 1.16.0 vs Gurobi 13.0.2)
+### 핵심 결과 (P6 vs P5 vs HiGHS 1.16.0 vs Gurobi 13.0.2)
 
 #### ① 30초 전 seed 최적 증명 수 및 속도
-| 구분 | 전체 | **scsp (P5)** | scsp (P4) | scsp (P3) | HiGHS | Gurobi |
+| 구분 | 전체 | **scsp (P6)** | scsp (P5) | scsp (P4) | HiGHS | Gurobi |
 |---|---:|---:|---:|---:|---:|---:|
-| **SC 전체** | 90 | **74** | 69 | 63 | 68 | 40 / 40 |
-| **SPP 전체** | 63 | **58** | 56 | 54 | 52 | 27 / 31 |
-| **합계** | **153** | **132** | 125 | 117 | **120** | 67 / 71 |
+| **SC 전체** | 90 | **74** | 74 | 69 | 68 | 40 / 40 |
+| **SPP 전체** | 63 | **58** | 58 | 56 | 52 | 27 / 31 |
+| **합계** | **153** | **132** | 132 | 125 | **120** | 67 / 71 |
 
+* **vs P5 (공통 132개)**: 총 증명 시간 **196.86초 → 150.95초 (1.30× 빠름, 98/132 승)**, 기하평균 비 **0.882** (주요 난이도 24개 인스턴스 **24/24 전량 단축**).
 * **vs HiGHS**:
   * 증명 수 **132 vs 120 (+12개 우위)** — HiGHS가 30초 내 증명한 인스턴스를 **1개도 빠짐없이** scsp도 증명했습니다(`scpnre` 5/5, `scpnrf` 5/5, `sppnw/aa/us/kl` 55/55 전량 증명).
-  * 양쪽 모두 증명한 120개 기준 증명 시간 합 **98.86초 vs 367.74초 (3.72× 빠름)**, 시간 비 기하평균 **0.22**, **100/120개(83.3%)에서 우위**.
+  * 양쪽 모두 증명한 120개 기준 증명 시간 합 **71.72초 vs 367.74초 (5.13× 빠름)**, 시간 비 기하평균 **0.196**, **100/120개(83.3%)에서 우위**.
+  * LP 단독(`scsp.bench.lpcheck`, 156개 전체): **156/156 일치**(최대 상대오차 `1.4e-13`), 총 시간 **6.72초 vs 41.70초**, 기하평균 비 **0.27**, **152/156 승**.
 * **vs Gurobi (71개)**:
-  * 증명 수 **67/71 vs 67/71 완전 동률**. 공통 증명 67개 중 **35개(52.2%)에서 scsp가 더 빠르며**, 시간 비 기하평균 **1.27**.
+  * 증명 수 **67/71 vs 67/71 완전 동률**. 공통 증명 67개 기준 총 시간 **40.01초(P5) → 24.33초(P6, −39.2%)** vs Gurobi 15.26초, **36/67개(53.7%)에서 우위**, 시간 비 기하평균 **1.126**.
 
 #### ② 고정 시간 해 품질 (승 / 무 / 패, 평균 목적값 차이 %)
 | 비교 대상 | 5초 | 10초 | 30초 | 비고 |
 |---|---|---|---|---|
-| **SC vs HiGHS (90개)** | **14 / 73 / 3 (−1.48%)** | **11 / 76 / 3 (−1.03%)** | **7 / 77 / 6 (−0.27%)** | `dms` 17개 전 구간 무패 (−2.32~−1.42%) |
-| **SPP vs HiGHS (62개)** | **18 / 43 / 1 (−0.46%)** | **15 / 46 / 1 (−0.74%)** | **10 / 52 / 0 (−1.93%)** | **30초 62개 전량 무패** |
+| **SC vs HiGHS (90개)** | **20 / 70 / 0 (−1.55%)** | **15 / 75 / 0 (−1.10%)** | **11 / 79 / 0 (−0.32%)** | **5·10·30초 전 구간 무패(0패)** |
+| **SPP vs HiGHS (62개)** | **19 / 43 / 0 (−1.18%)** | **16 / 46 / 0 (−0.98%)** | **10 / 52 / 0 (−2.03%)** | **5·10·30초 전 구간 무패(0패)** |
 | **SC vs Gurobi (40개)** | **0 / 40 / 0 (+0.00%)** | **0 / 40 / 0 (+0.00%)** | **0 / 40 / 0 (+0.00%)** | **5·10·30초 전 구간 전량 동률** |
-| **SPP vs Gurobi (31개)** | 2 / 26 / 3 (+0.22%) | 0 / 26 / 5 (+0.26%) | 0 / 27 / 4 (+0.14%) | `sppnw` 24/24 동률, 합성 `sp` +0.64% |
-| **DMS 시작해 `near` vs `highs-nopre`** | **10 / 7 / 0 (−0.90%)** | **8 / 9 / 0 (−0.75%)** | **6 / 11 / 0 (−0.62%)** | Gurobi 10개 대비 10·30초 전량 동률 |
-| **DMS 시작해 `indep` vs `highs-nopre`** | **10 / 7 / 0 (−1.80%)** | **8 / 9 / 0 (−1.64%)** | **7 / 10 / 0 (−1.33%)** | Gurobi 10개 대비 10·30초 전량 동률 |
+| **SPP vs Gurobi (31개)** | **3 / 26 / 2 (−0.18%)** | **3 / 27 / 1 (−0.04%)** | **2 / 27 / 2 (−0.01%)** | **전 시점 평균 우위**, 합성 `sp` −0.81~−0.04% |
+| **DMS 시작해 `near` vs `highs-nopre`** | **10 / 7 / 0 (−0.89%)** | **8 / 9 / 0 (−0.75%)** | **6 / 11 / 0 (−0.62%)** | Gurobi 10개 대비 **5·10·30초 전량 동률** |
+| **DMS 시작해 `indep` vs `highs-nopre`** | **10 / 7 / 0 (−1.82%)** | **8 / 9 / 0 (−1.64%)** | **7 / 10 / 0 (−1.34%)** | Gurobi 10개 대비 **5·10·30초 전량 동률** |
 
-#### ③ 단계별 진화 (P0 → P5)
+* 대형 미증명 SC: `scpnrg`·`scpnrh` **50/50 전 seed 5초 내 BKS(0.00%) 도달**, `rail507` 전 seed 30초 내 BKS(`174`) 도달.
+* 대형 합성 SPP(`sp`): `gap@30s` **0.90% → 0.12%** (Gurobi 0.16% 추월), Primal Integral **10.19% → 1.54% (6.6× 단축)**.
+* 신규 BKS 3건 경신: `sp_m300_n10000_s1` (`66383`), `dms_K500_n30000_s1` (`3243.7546`), `dms_K1000_n60000_s1` (`3220.9095`).
+
+#### ③ 단계별 진화 (P0 → P6)
 | 단계 | 핵심 구현 | 30초 최적 증명 | 비고 |
 |---|---|---:|---|
 | P0 | 벤치마크 하네스·리더·합성 생성기 | – | 153개 인스턴스 · BKS · 4대 지표 체계 |
@@ -75,9 +81,10 @@ $$\text{s.t.}\quad \sum_{j \in S_i} x_j \; (\ge \mid = \mid \le)\; 1 \quad \fora
 | P2 | 자체 C++17 dual/primal simplex · LU · sifting | – | 전 인스턴스 HiGHS LP와 상대오차 ≤ 1e-6 |
 | P3 | LP 기반 B&B, reduced cost fixing, SPP 경로 | 117 / 153 | SC/SPP 통합 정확해법 구축 |
 | P4 | Zero-half·clique 컷, SPP presolve, RINS/LNS | 125 / 153 | 루트 gap 50~75%·노드 70.5% 감소, HiGHS 추월 |
-| **P5** | **4스레드 병렬 B&C 트리, SC/SPP 동적 워커 합류** | **132 / 153** | **HiGHS +12개 우위(3.72×), Gurobi 67/71 동률** |
+| P5 | 4스레드 병렬 B&C 트리, SC/SPP 동적 워커 합류 | 132 / 153 | HiGHS +12개 우위(3.72×), Gurobi 67/71 동률 |
+| **P6** | **Hypersparse LU/LP, 도메인 전파·GMI 컷, SPP 병렬 첫 해/클러스터 LNS, SC 3-flip/동적 행 가중치** | **132 / 153** | **HiGHS 5.13× 단축 · 전 구간 무패(0패), Gurobi SPP 우위 전환, `scpnrg/h`·`rail507` 전량 BKS** |
 
-자세한 세트별 표, 인스턴스별 증명 시간, Primal Integral 및 최종 gap은 [docs/p5_report.md](docs/p5_report.md)를 참고하세요.
+자세한 세트별 표, 인스턴스별 증명 시간, Primal Integral 및 최종 gap은 [docs/p6_report.md](docs/p6_report.md)를 참고하세요.
 
 ---
 
@@ -92,7 +99,7 @@ python -m pip install pybind11 cmake scikit-build-core ninja
 # 2) 개발용(editable) 빌드 및 설치
 python -m pip install -e . --no-build-isolation
 
-# 3) 단위 테스트 실행 (170개, OR-Tools 선택 테스트 제외)
+# 3) 단위 테스트 실행 (180개, OR-Tools 선택 테스트 제외)
 python -I -m pytest -q tests --ignore=tests/test_ortools.py
 ```
 
@@ -137,7 +144,7 @@ print(res.stats["path"], res.stats["bnb_nodes"], res.stats["cuts"])
 
 주요 선택 인자 (`scsp.solve`):
 * `bnb=False`: SC 모델에서 LP·B&C를 끄고 4스레드 Lagrangian 휴리스틱(P1)만 실행.
-* `cuts=0`: 루트 절단평면 비활성화(기본 `None`은 자동: SC `1`, 일반 0-1 경로 `7`).
+* `cuts=0`: 루트 절단평면 비활성화(기본 `None`은 자동: SC `9`[zero-half+GMI], 일반 0-1 경로 `15`[zero-half+odd-hole+clique+GMI]).
 * `tree_giveup`: SC에서 가망 없는 트리 스레드를 휴리스틱으로 되돌리는 배수 기준(기본 `3.0`, `0`이면 포기 안 함).
 * `verify=True`: 반환해를 `Model`로 독립 재검증(`res.verified`).
 
@@ -217,10 +224,10 @@ python -I -m scsp.bench.lpcheck
 
 | 경로 | 내용 |
 |---|---|
-| `include/scsp/`, `src/core/` | C++17 코어: `problem`(모델), `presolve`(SC 전처리), `sc_solver`(Lagrangian CFT·로컬 탐색·트리 반환·동적 합류), `lu`(희소 LU · Forrest–Tomlin 업데이트), `lp`(bounded dual/primal simplex · sifting · `LpSolver` · `clone`), `cuts`(zero-half · odd-hole · clique 분리), `bnb`(병렬 Branch-and-Cut · `BnbTeam` · RINS · diving · FP · cover search), `bin_solver`(일반 0-1 경로 · 분할 presolve · gap 기반 병렬 LNS/RINS) |
+| `include/scsp/`, `src/core/` | C++17 코어: `problem`(모델), `presolve`(SC 전처리), `sc_solver`(Lagrangian CFT·2/3-flip·동적 행 가중치 타부 탐색·트리 반환·동적 합류), `lu`(적응형 hypersparse LU · 행 기준 Markowitz · Forrest–Tomlin 업데이트), `lp`(bounded dual/primal simplex · 희소 DSE · sifting · `LpSolver` · `clone` · 태블로 행 추출), `cuts`(zero-half · odd-hole · clique · GMI 분리), `bnb`(도메인/충돌 전파 병렬 Branch-and-Cut · `BnbTeam` · 병렬 첫 해 스프린트 · RINS · diving · Objective FP · cover search), `bin_solver`(일반 0-1 경로 · 분할 presolve · 클러스터 LNS · 비대칭 Local Branching · RINS) |
 | `src/bindings/` | pybind11 바인딩 `scsp._core` (`solve_sc`, `solve_bin`, `presolve_sc`, `solve_lp`, `LpSolver`) |
 | `python/scsp/` | Python API (`model.py`, `solve.py`, `lp.py`, `dms.py`), 리더 (`io/`), 합성 생성기 (`gen/`), 벤치마크 하네스 (`bench/`) |
-| `tests/` | 단위·통합 테스트 스위트 (170개, `test_p4.py`, `test_p5.py`, `test_lp*.py`, `test_bnb.py` 등) |
-| `benchmarks/` | 인스턴스 크기표(`instance_sizes.csv`), `bks.csv`, `results/`(P0~P5 실행 원자료·비교표·지표) |
-| `docs/` | 설계서(`design.md`), 단계별 보고서(`p0_report.md`~`p5_report.md`), 출처 문헌(`references.md`) |
+| `tests/` | 단위·통합 테스트 스위트 (180개, `test_p4.py`, `test_p5.py`, `test_p6.py`, `test_lp*.py`, `test_bnb.py` 등) |
+| `benchmarks/` | 인스턴스 크기표(`instance_sizes.csv`), `bks.csv`, `results/`(P0~P6 실행 원자료·비교표·지표) |
+| `docs/` | 설계서(`design.md`), 단계별 보고서(`p0_report.md`~`p6_report.md`), 출처 문헌(`references.md`) |
 | `scripts/` | 인스턴스 다운로드, Linux 빌드(`linux_build.sh`, `linux_native_build.sh`), 기준 실행 스크립트 |
