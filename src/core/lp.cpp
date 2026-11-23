@@ -15,6 +15,7 @@ namespace scsp {
 struct LpSolver::Snapshot {
   const void* owner = nullptr;
   uint64_t cost_epoch = 0;
+  uint64_t active_epoch = 0;
   BasisLU lu;
   std::vector<int> head, bpos;
   std::vector<double> d, y, x;
@@ -95,26 +96,118 @@ class Simplex {
 
   // Call after adding columns and before solving.
   void finalize() {
-    rptr.assign(m + 1, 0);
-    for (int i : cidx) ++rptr[i + 1];
-    for (int i = 0; i < m; ++i) rptr[i + 1] += rptr[i];
-    ridx.resize(cidx.size());
-    rval.resize(cidx.size());
-    row_unit.assign(m, 1);
-    std::vector<int> pos(rptr.begin(), rptr.end() - 1);
-    for (int j = 0; j < nc; ++j)
-      for (int q = cptr[j]; q < cptr[j + 1]; ++q) {
-        const int i = cidx[q];
-        const double v = cval[q];
-        if (v != 1.0) row_unit[i] = 0;
-        ridx[pos[i]] = m + j;
-        rval[pos[i]++] = v;
-      }
+    rebuild_rows();
     arow.assign(m + nc, 0.0);
     touched.resize(m + nc);
     n_touched = 0;
     cands.resize(m + nc);
     devex.assign(m + nc, 1.0);
+  }
+
+  void rebuild_rows(const std::vector<char>* iw = nullptr) {
+    rptr.assign(m + 1, 0);
+    if (!iw || iw->empty()) {
+      use_active = false;
+      active_list.clear();
+      for (int i : cidx) ++rptr[i + 1];
+      for (int i = 0; i < m; ++i) rptr[i + 1] += rptr[i];
+      ridx.resize(cidx.size());
+      rval.resize(cidx.size());
+      row_unit.assign(m, 1);
+      std::vector<int> pos(rptr.begin(), rptr.end() - 1);
+      for (int j = 0; j < nc; ++j)
+        for (int q = cptr[j]; q < cptr[j + 1]; ++q) {
+          const int i = cidx[q];
+          const double v = cval[q];
+          if (v != 1.0) row_unit[i] = 0;
+          ridx[pos[i]] = m + j;
+          rval[pos[i]++] = v;
+        }
+    } else {
+      use_active = true;
+      active_list.clear();
+      size_t nnz_act = 0;
+      for (int j = 0; j < nc; ++j) {
+        if ((*iw)[j]) {
+          active_list.push_back(j);
+          for (int q = cptr[j]; q < cptr[j + 1]; ++q) {
+            ++rptr[cidx[q] + 1];
+            ++nnz_act;
+          }
+        }
+      }
+      for (int i = 0; i < m; ++i) rptr[i + 1] += rptr[i];
+      ridx.resize(nnz_act);
+      rval.resize(nnz_act);
+      row_unit.assign(m, 1);
+      std::vector<int> pos(rptr.begin(), rptr.end() - 1);
+      for (int j : active_list)
+        for (int q = cptr[j]; q < cptr[j + 1]; ++q) {
+          const int i = cidx[q];
+          const double v = cval[q];
+          if (v != 1.0) row_unit[i] = 0;
+          ridx[pos[i]] = m + j;
+          rval[pos[i]++] = v;
+        }
+    }
+  }
+
+  void set_active(const std::vector<char>& iw, const std::vector<double>& ext_lb, const std::vector<double>& ext_ub) {
+    ++active_epoch;
+    if (iw.empty()) {
+      for (int j = 0; j < nc; ++j) {
+        lo[m + j] = ext_lb[j];
+        up[m + j] = ext_ub[j];
+      }
+      rebuild_rows(nullptr);
+      return;
+    }
+    for (int j = 0; j < nc; ++j) {
+      if (iw[j]) {
+        lo[m + j] = ext_lb[j];
+        up[m + j] = ext_ub[j];
+      } else {
+        lo[m + j] = 0.0;
+        up[m + j] = 0.0;
+        st[m + j] = LOWER;
+        x[m + j] = 0.0;
+        d[m + j] = 0.0;
+      }
+    }
+    rebuild_rows(&iw);
+  }
+
+  void activate_subset(const std::vector<int>& added, const std::vector<double>& ext_lb,
+                       const std::vector<double>& ext_ub, const std::vector<char>& iw) {
+    if (added.empty()) return;
+    ++active_epoch;
+    if (cost_mod) {
+      c = c0;
+      cost_mod = false;
+    }
+    for (int k : added) {
+      active_list.push_back(k);
+      const int v = m + k;
+      lo[v] = ext_lb[k];
+      up[v] = ext_ub[k];
+      double dv = c0[v];
+      for (int q = cptr[k]; q < cptr[k + 1]; ++q) dv -= cval[q] * y[cidx[q]];
+      d[v] = dv;
+      if (lo[v] == up[v]) {
+        st[v] = LOWER;
+        x[v] = lo[v];
+        if (x[v] != 0.0) primal_valid = false;
+      } else if (dv < -opt.opt_tol && up[v] < INF) {
+        st[v] = UPPER;
+        x[v] = up[v];
+        primal_valid = false;
+      } else {
+        st[v] = lo[v] > -INF ? LOWER : (up[v] < INF ? UPPER : FREE);
+        x[v] = st[v] == LOWER ? lo[v] : (st[v] == UPPER ? up[v] : 0.0);
+        if (x[v] != 0.0) primal_valid = false;
+      }
+    }
+    rebuild_rows(&iw);
   }
 
   void set_cost(int v, double cost) {
@@ -179,11 +272,12 @@ class Simplex {
   const std::vector<char>& basis() const { return st; }
 
   void sync_bounds_after_restore() {
-    bool pok = true, dok = true;
-    const int nv = m + nc;
-    for (int v = 0; v < nv; ++v) {
+    // Only preserve primal/dual validity if already valid prior to bound checks
+    // (e.g. set_basis may hit b == st after set_bounds already invalidated primal_valid).
+    bool pok = primal_valid, dok = dual_valid;
+    auto check_v = [&](int v) {
       const char s = st[v];
-      if (s == BASIC) continue;
+      if (s == BASIC) return;
       if (s == LOWER) {
         if (lo[v] > -INF) {
           if (x[v] != lo[v]) x[v] = lo[v], pok = false;
@@ -214,6 +308,13 @@ class Simplex {
             (ns == FREE && std::fabs(dv) > opt.opt_tol))
           dok = false;
       }
+    };
+    if (!use_active) {
+      const int nv = m + nc;
+      for (int v = 0; v < nv; ++v) check_v(v);
+    } else {
+      for (int v = 0; v < m; ++v) check_v(v);
+      for (int j : active_list) check_v(m + j);
     }
     primal_valid = pok;
     dual_valid = dok;
@@ -257,11 +358,15 @@ class Simplex {
     if (static_cast<int>(w.size()) == m) dse = w;
   }
 
-  bool can_snapshot() const { return factored && !cost_mod; }
+  bool can_snapshot() const { return factored && !cost_mod && primal_valid && dual_valid; }
 
   double objective() const {
     double s = 0.0;
-    for (int v = m; v < m + nc; ++v) s += c0[v] * x[v];
+    if (!use_active) {
+      for (int v = m; v < m + nc; ++v) s += c0[v] * x[v];
+    } else {
+      for (int j : active_list) s += c0[m + j] * x[m + j];
+    }
     return s;
   }
 
@@ -301,8 +406,7 @@ class Simplex {
       if (it_dual + it_primal >= opt.max_iter) return LIMIT;
       if (iter_cap >= 0 && it_dual - it_start >= iter_cap) return LIMIT;
       if (cutoff < INF && !cost_mod && cur_obj > cutoff - 1e-6 * (1.0 + std::fabs(cutoff))) {
-        double ob = 0.0;
-        for (int v = m; v < m + nc; ++v) ob += c[v] * x[v];
+        const double ob = objective();
         cur_obj = ob;
         if (ob > cutoff) return CUTOFF;
       }
@@ -674,6 +778,7 @@ class Simplex {
   void fill_snapshot(LpSolver::Snapshot& sd) const {
     sd.owner = this;
     sd.cost_epoch = cost_epoch;
+    sd.active_epoch = active_epoch;
     sd.lu = lu;
     sd.head = head;
     sd.bpos = bpos;
@@ -684,7 +789,9 @@ class Simplex {
   }
 
   bool restore_snapshot(const std::vector<char>& b, const std::vector<double>& w, const LpSolver::Snapshot& sd) {
-    if (sd.owner != this || sd.cost_epoch != cost_epoch || static_cast<int>(b.size()) != m + nc) return false;
+    if (sd.owner != this || sd.cost_epoch != cost_epoch || sd.active_epoch != active_epoch ||
+        static_cast<int>(b.size()) != m + nc)
+      return false;
     if (cost_mod) {
       c = c0;
       cost_mod = false;
@@ -699,9 +806,14 @@ class Simplex {
     x = sd.x;
     cur_obj = sd.cur_obj;
     factored = true;
+    primal_valid = true;
+    dual_valid = true;
     sync_bounds_after_restore();
     return true;
   }
+
+  bool is_dual_feasible() const { return dual_feasible(); }
+  int active_count() const { return use_active ? static_cast<int>(active_list.size()) : nc; }
 
  private:
   struct Cand {
@@ -735,12 +847,21 @@ class Simplex {
   }
 
   bool dual_feasible() const {
-    const int nv = m + nc;
-    for (int v = 0; v < nv; ++v) {
+    auto ok_v = [&](int v) {
       const char s = st[v];
-      if (s == BASIC || lo[v] == up[v]) continue;
+      if (s == BASIC || lo[v] == up[v]) return true;
       const double viol = s == LOWER ? -d[v] : (s == UPPER ? d[v] : std::fabs(d[v]));
-      if (viol > opt.opt_tol) return false;
+      return viol <= opt.opt_tol;
+    };
+    if (!use_active) {
+      const int nv = m + nc;
+      for (int v = 0; v < nv; ++v)
+        if (!ok_v(v)) return false;
+    } else {
+      for (int v = 0; v < m; ++v)
+        if (!ok_v(v)) return false;
+      for (int j : active_list)
+        if (!ok_v(m + j)) return false;
     }
     return true;
   }
@@ -803,14 +924,20 @@ class Simplex {
 
       int q = -1;
       double best = 0.0;
-      for (int v = 0; v < nv; ++v) {
+      auto check_q = [&](int v) {
         const char s = st[v];
-        if (s == BASIC || lo[v] == up[v]) continue;
+        if (s == BASIC || lo[v] == up[v]) return;
         const double dv = d[v];
         const double viol = s == LOWER ? -dv : (s == UPPER ? dv : std::fabs(dv));
-        if (viol <= opt.opt_tol) continue;
+        if (viol <= opt.opt_tol) return;
         const double score = dv * dv / devex[v];
         if (score > best) best = score, q = v;
+      };
+      if (!use_active) {
+        for (int v = 0; v < nv; ++v) check_q(v);
+      } else {
+        for (int v = 0; v < m; ++v) check_q(v);
+        for (int j : active_list) check_q(m + j);
       }
       if (q < 0) {
         if (lu.updates() == 0) return OPTIMAL;
@@ -949,12 +1076,14 @@ class Simplex {
   std::vector<int> posv_idx, rowv_idx, rho_idx, aq_idx, tau_idx, spike_idx, rmark;
   int rmark_gen = 0;
   std::vector<char> row_unit;
-  std::vector<int> touched, flips;
+  std::vector<int> touched, flips, active_list;
+  bool use_active = false;
   int n_touched = 0;
   std::vector<Cand> cands;
   std::vector<std::pair<int, int>> bad;
   const double minus_one = -1.0;
   uint64_t cost_epoch = 0;
+  uint64_t active_epoch = 0;
   double cur_obj = 0.0;
   bool factored = false;      // the LU factors belong to the current basis and d is current
   bool cost_mod = false;      // c differs from c0 (perturbation or shifting)
@@ -1008,11 +1137,16 @@ class Simplex {
   void compute_primal() {
     for (int i = 0; i < m; ++i)
       if (st[i] != BASIC) rowv[i] += x[i];
-    for (int j = 0; j < nc; ++j) {
+    auto add_col = [&](int j) {
       const int v = m + j;
       const double xv = x[v];
-      if (st[v] == BASIC || xv == 0.0) continue;
+      if (st[v] == BASIC || xv == 0.0) return;
       for (int q = cptr[j]; q < cptr[j + 1]; ++q) rowv[cidx[q]] -= cval[q] * xv;
+    };
+    if (!use_active) {
+      for (int j = 0; j < nc; ++j) add_col(j);
+    } else {
+      for (int j : active_list) add_col(j);
     }
     lu.ftran(rowv, posv);  // clears rowv to zero
     for (int p = 0; p < m; ++p) {
@@ -1020,7 +1154,11 @@ class Simplex {
       posv[p] = 0.0;
     }
     double ob = 0.0;
-    for (int v = m; v < m + nc; ++v) ob += c[v] * x[v];
+    if (!use_active) {
+      for (int v = m; v < m + nc; ++v) ob += c[v] * x[v];
+    } else {
+      for (int j : active_list) ob += c[m + j] * x[m + j];
+    }
     cur_obj = ob;
   }
 
@@ -1028,15 +1166,20 @@ class Simplex {
     for (int p = 0; p < m; ++p) posv[p] = c[head[p]];
     lu.btran(posv, y);  // clears posv to zero
     for (int i = 0; i < m; ++i) d[i] = st[i] == BASIC ? 0.0 : c[i] + y[i];
-    for (int j = 0; j < nc; ++j) {
+    auto dual_col = [&](int j) {
       const int v = m + j;
       if (st[v] == BASIC) {
         d[v] = 0.0;
-        continue;
+        return;
       }
       double s = c[v];
       for (int q = cptr[j]; q < cptr[j + 1]; ++q) s -= cval[q] * y[cidx[q]];
       d[v] = s;
+    };
+    if (!use_active) {
+      for (int j = 0; j < nc; ++j) dual_col(j);
+    } else {
+      for (int j : active_list) dual_col(j);
     }
   }
 
@@ -1045,10 +1188,9 @@ class Simplex {
   // Returns true iff any nonbasic x[v] changed.
   bool fix_dual() {
     bool x_changed = false;
-    const int nv = m + nc;
-    for (int v = 0; v < nv; ++v) {
+    auto fix_v = [&](int v) {
       const char s = st[v];
-      if (s == BASIC || lo[v] == up[v]) continue;
+      if (s == BASIC || lo[v] == up[v]) return;
       const double dv = d[v];
       if (s == LOWER && dv < -opt.opt_tol) {
         if (up[v] < INF) {
@@ -1067,21 +1209,38 @@ class Simplex {
       } else if (s == FREE && std::fabs(dv) > opt.opt_tol) {
         c[v] -= dv, d[v] = 0.0, cost_mod = true;
       }
+    };
+    if (!use_active) {
+      const int nv = m + nc;
+      for (int v = 0; v < nv; ++v) fix_v(v);
+    } else {
+      for (int v = 0; v < m; ++v) fix_v(v);
+      for (int j : active_list) fix_v(m + j);
     }
     return x_changed;
   }
 
   void perturb() {
     double sum = 0.0;
-    for (int j = 0; j < nc; ++j) sum += std::fabs(c0[m + j]);
-    const double avg = nc > 0 ? sum / nc : 1.0;
+    const int n_act = use_active ? static_cast<int>(active_list.size()) : nc;
+    if (!use_active) {
+      for (int j = 0; j < nc; ++j) sum += std::fabs(c0[m + j]);
+    } else {
+      for (int j : active_list) sum += std::fabs(c0[m + j]);
+    }
+    const double avg = n_act > 0 ? sum / n_act : 1.0;
     std::uniform_real_distribution<double> u(0.5, 1.0);
-    for (int j = 0; j < nc; ++j) {
+    auto pert_j = [&](int j) {
       const int v = m + j;
-      if (st[v] == BASIC || lo[v] == up[v]) continue;
+      if (st[v] == BASIC || lo[v] == up[v]) return;
       const double eps = 1e-6 * (std::fabs(c0[v]) + avg) * u(rng);
       if (st[v] == LOWER) c[v] += eps, d[v] += eps;
       else if (st[v] == UPPER) c[v] -= eps, d[v] -= eps;
+    };
+    if (!use_active) {
+      for (int j = 0; j < nc; ++j) pert_j(j);
+    } else {
+      for (int j : active_list) pert_j(j);
     }
     cost_mod = true;
   }
@@ -1245,7 +1404,8 @@ struct LpSolver::Impl {
   double cutoff = INF;
   long iters_base = 0;  // iterations of the simplex objects replaced by add_rows / remove_rows
   // the loaded problem (rows grow with add_rows): row sides, columns with scaled costs
-  std::vector<double> rlo, rup, cost;
+  std::vector<double> rlo, rup, cost, ext_lb, ext_ub;
+  std::vector<char> in_work;
   std::vector<int> cptr, cidx;
   std::vector<double> cval;
   std::unique_ptr<Simplex> S;
@@ -1255,34 +1415,32 @@ struct LpSolver::Impl {
     double cmax = 0.0;
     for (double cj : P.cost) cmax = std::max(cmax, std::fabs(cj));
     cs = cmax > 0.0 ? cmax : 1.0;
-    std::vector<double> lb, ub;
     cptr.assign(1, 0);
     auto add = [&](int j) {
       cidx.insert(cidx.end(), P.cidx.begin() + P.cptr[j], P.cidx.begin() + P.cptr[j + 1]);
       cval.insert(cval.end(), P.cval.begin() + P.cptr[j], P.cval.begin() + P.cptr[j + 1]);
       cptr.push_back(static_cast<int>(cidx.size()));
       cost.push_back(P.cost[j] / cs);
-      lb.push_back(P.lb[j]);
-      ub.push_back(P.ub[j]);
+      ext_lb.push_back(P.lb[j]);
+      ext_ub.push_back(P.ub[j]);
     };
     if (cols.empty())
       for (int j = 0; j < P.n; ++j) add(j);
     else
       for (int j : cols) add(j);
     nc = static_cast<int>(cost.size());
-    build(lb, ub, nullptr);
+    build(ext_lb, ext_ub, nullptr);
   }
 
   Impl(const Impl& src, unsigned seed, double time_limit, const std::atomic<bool>* stop)
       : opt(src.opt), cs(src.cs), offset(src.offset), m(src.m), nc(src.nc), cutoff(src.cutoff),
-        rlo(src.rlo), rup(src.rup), cost(src.cost), cptr(src.cptr), cidx(src.cidx), cval(src.cval) {
+        rlo(src.rlo), rup(src.rup), cost(src.cost), ext_lb(src.ext_lb), ext_ub(src.ext_ub),
+        in_work(src.in_work), cptr(src.cptr), cidx(src.cidx), cval(src.cval) {
     opt.seed = seed;
     opt.time_limit = time_limit;
     opt.stop = stop;
-    std::vector<double> lb, ub;
-    src.column_bounds(lb, ub);
     const std::vector<char>& basis = src.S->basis();
-    build(lb, ub, src.first ? nullptr : &basis);
+    build(ext_lb, ext_ub, src.first ? nullptr : &basis);
     if (!first) S->set_weights(src.S->weights());
   }
 
@@ -1290,15 +1448,23 @@ struct LpSolver::Impl {
   void build(const std::vector<double>& lb, const std::vector<double>& ub, const std::vector<char>* basis) {
     if (S) iters_base += S->it_dual + S->it_primal;
     S.reset(new Simplex(m, rlo.data(), rup.data(), opt, timer));
-    for (int k = 0; k < nc; ++k)
-      S->add_column(cidx.data() + cptr[k], cval.data() + cptr[k], cptr[k + 1] - cptr[k], cost[k], lb[k], ub[k]);
-    S->finalize();
+    if (in_work.empty()) {
+      for (int k = 0; k < nc; ++k)
+        S->add_column(cidx.data() + cptr[k], cval.data() + cptr[k], cptr[k + 1] - cptr[k], cost[k], lb[k], ub[k]);
+      S->finalize();
+    } else {
+      for (int k = 0; k < nc; ++k)
+        S->add_column(cidx.data() + cptr[k], cval.data() + cptr[k], cptr[k + 1] - cptr[k], cost[k],
+                      in_work[k] ? lb[k] : 0.0, in_work[k] ? ub[k] : 0.0);
+      S->finalize();
+      S->set_active(in_work, lb, ub);
+    }
     first = !(basis && S->set_basis(*basis));
   }
 
   void column_bounds(std::vector<double>& lb, std::vector<double>& ub) const {
-    lb.assign(S->lo.begin() + m, S->lo.end());
-    ub.assign(S->up.begin() + m, S->up.end());
+    lb = ext_lb;
+    ub = ext_ub;
   }
 };
 
@@ -1429,13 +1595,31 @@ LpSolver::Status LpSolver::solve(double cutoff, long max_iter) {
   I.first = false;
   return static_cast<Status>(s);
 }
-void LpSolver::set_col_bounds(int k, double lb, double ub) { impl_->S->set_bounds(impl_->m + k, lb, ub); }
+void LpSolver::set_col_bounds(int k, double lb, double ub) {
+  Impl& I = *impl_;
+  I.ext_lb[k] = lb;
+  I.ext_ub[k] = ub;
+  if (I.in_work.empty() || I.in_work[k]) {
+    I.S->set_bounds(I.m + k, lb, ub);
+  } else if (lb > 0.0) {
+    activate_cols({k});
+  }
+}
 void LpSolver::set_col_cost(int k, double cost) {
   impl_->cost[k] = cost / impl_->cs;
   impl_->S->change_cost(impl_->m + k, cost / impl_->cs);
 }
 std::vector<char> LpSolver::get_basis() const { return impl_->S->basis(); }
-bool LpSolver::set_basis(const std::vector<char>& b) { return impl_->S->set_basis(b); }
+bool LpSolver::set_basis(const std::vector<char>& b) {
+  Impl& I = *impl_;
+  if (!I.in_work.empty() && static_cast<int>(b.size()) == I.m + I.nc) {
+    std::vector<int> need;
+    for (int k = 0; k < I.nc; ++k)
+      if (!I.in_work[k] && b[I.m + k] != Simplex::LOWER) need.push_back(k);
+    if (!need.empty()) activate_cols(need);
+  }
+  return I.S->set_basis(b);
+}
 void LpSolver::save_state(State& s) const {
   s.basis = impl_->S->basis();
   s.weights = impl_->S->weights();
@@ -1457,6 +1641,73 @@ double LpSolver::obj() const { return impl_->S->objective() * impl_->cs + impl_-
 int LpSolver::cols() const { return impl_->nc; }
 int LpSolver::rows() const { return impl_->m; }
 long LpSolver::iterations() const { return impl_->iters_base + impl_->S->it_dual + impl_->S->it_primal; }
+
+void LpSolver::set_working_cols(const std::vector<char>& active) {
+  Impl& I = *impl_;
+  if (active.empty()) {
+    I.in_work.clear();
+    I.S->set_active(I.in_work, I.ext_lb, I.ext_ub);
+    return;
+  }
+  I.in_work = active;
+  for (int k = 0; k < I.nc; ++k)
+    if (I.S->st[I.m + k] == Simplex::BASIC || I.ext_lb[k] > 0.0 || I.S->x[I.m + k] != 0.0) I.in_work[k] = 1;
+  I.S->set_active(I.in_work, I.ext_lb, I.ext_ub);
+}
+
+void LpSolver::activate_cols(const std::vector<int>& add_cols) {
+  Impl& I = *impl_;
+  if (I.in_work.empty() || add_cols.empty()) return;
+  std::vector<int> added;
+  for (int k : add_cols)
+    if (k >= 0 && k < I.nc && !I.in_work[k]) {
+      I.in_work[k] = 1;
+      added.push_back(k);
+    }
+  if (!added.empty()) I.S->activate_subset(added, I.ext_lb, I.ext_ub, I.in_work);
+}
+
+void LpSolver::activate_all_unfixed() {
+  Impl& I = *impl_;
+  if (I.in_work.empty()) return;
+  std::vector<int> added;
+  for (int k = 0; k < I.nc; ++k)
+    if (!I.in_work[k] && I.ext_ub[k] > I.ext_lb[k]) {
+      I.in_work[k] = 1;
+      added.push_back(k);
+    }
+  if (!added.empty()) I.S->activate_subset(added, I.ext_lb, I.ext_ub, I.in_work);
+}
+
+bool LpSolver::price_inactive(std::vector<int>& neg_cols, double tol) {
+  neg_cols.clear();
+  Impl& I = *impl_;
+  if (I.in_work.empty()) return true;
+  if (!I.S->refresh() || !I.S->is_dual_feasible()) return false;
+  const double* const yp = I.S->y.data();
+  const double st_tol = std::max(I.opt.opt_tol, tol / std::max(1.0, I.cs));
+  std::vector<std::pair<double, int>> neg;
+  for (int k = 0; k < I.nc; ++k) {
+    if (I.in_work[k] || I.ext_lb[k] >= I.ext_ub[k]) continue;
+    double dk = I.cost[k];
+    for (int q = I.cptr[k]; q < I.cptr[k + 1]; ++q) dk -= I.cval[q] * yp[I.cidx[q]];
+    if (dk < -st_tol) neg.push_back({dk, k});
+  }
+  std::sort(neg.begin(), neg.end());
+  neg_cols.reserve(neg.size());
+  for (const auto& pr : neg) neg_cols.push_back(pr.second);
+  return true;
+}
+
+int LpSolver::active_cols_count() const {
+  const Impl& I = *impl_;
+  return I.in_work.empty() ? I.nc : I.S->active_count();
+}
+
+bool LpSolver::has_inactive_cols() const {
+  const Impl& I = *impl_;
+  return !I.in_work.empty() && I.S->active_count() < I.nc;
+}
 void LpSolver::get_x(std::vector<double>& x) const {
   const Impl& I = *impl_;
   x.assign(I.S->x.begin() + I.m, I.S->x.end());

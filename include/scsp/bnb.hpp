@@ -98,6 +98,8 @@ struct BnbResult {
   double root_cut = 0.0;       // LP value after the cut rounds of the last exact search (root_lp if there were none)
   int cuts = 0, cut_rounds = 0;  // cuts left in the LP after the rounds; rounds run
   double cut_time = 0.0;
+  long node_cuts = 0, node_cut_rounds = 0;
+  long root_probed = 0, learned_clauses = 0;
   long rins_calls = 0, rins_found = 0;
   double rins_time = 0.0;
 };

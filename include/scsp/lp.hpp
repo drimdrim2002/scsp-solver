@@ -124,6 +124,15 @@ class LpSolver {
   int rows() const;
   long iterations() const;
 
+  // Dynamic working column set for in-tree sifting on wide models (P7-3).
+  // External column indices 0..cols()-1 never change; inactive columns stay at 0 inside Simplex.
+  void set_working_cols(const std::vector<char>& active);
+  void activate_cols(const std::vector<int>& add_cols);
+  void activate_all_unfixed();
+  bool price_inactive(std::vector<int>& neg_cols, double tol = 1e-7);
+  int active_cols_count() const;
+  bool has_inactive_cols() const;
+
  private:
   struct Impl;
   explicit LpSolver(std::unique_ptr<Impl> impl);

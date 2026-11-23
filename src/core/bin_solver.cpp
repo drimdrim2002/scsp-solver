@@ -615,6 +615,52 @@ BinPresolve presolve_bin(const LpProblem& L) {
       }
     }
     if (Q.infeasible) break;
+    // 1-step conflict probing on packing/partition rows: if x_j = 1 eliminates every alive column
+    // of some partition row r2 that j does not cover, then x_j must be 0.
+    if (nonneg && m <= 2000 && n <= 25000) {
+      std::vector<int> stamp_row(m, -1), stamp_col(n, -1), hit_cnt(m, 0), touched_rows;
+      long probe_work = 0;
+      const long probe_limit = 3000000L;
+      for (int j = 0; j < n && probe_work < probe_limit; ++j) {
+        if (!ca[j] || csize[j] == 0) continue;
+        bool has_pack = false;
+        for (int q = L.cptr[j]; q < L.cptr[j + 1]; ++q) {
+          const int i = L.cidx[q];
+          if (ra[i]) {
+            stamp_row[i] = j;
+            if (unit[i] && rup[i] == 1.0 && rptr[i + 1] - rptr[i] <= 200) has_pack = true;
+          }
+        }
+        if (!has_pack) continue;
+        touched_rows.clear();
+        bool bad_j = false;
+        for (int q = L.cptr[j]; q < L.cptr[j + 1] && !bad_j && probe_work < probe_limit; ++q) {
+          const int i = L.cidx[q];
+          if (!ra[i] || !unit[i] || rup[i] != 1.0 || rptr[i + 1] - rptr[i] > 200) continue;
+          for (int a = rptr[i]; a < rptr[i + 1] && !bad_j; ++a) {
+            const int k = rcol[a];
+            if (!ca[k] || k == j || stamp_col[k] == j) continue;
+            stamp_col[k] = j;
+            for (int b = L.cptr[k]; b < L.cptr[k + 1]; ++b) {
+              const int r2 = L.cidx[b];
+              ++probe_work;
+              if (!part(r2) || stamp_row[r2] == j) continue;
+              if (hit_cnt[r2]++ == 0) touched_rows.push_back(r2);
+              if (hit_cnt[r2] == rsize[r2]) {
+                bad_j = true;
+                break;
+              }
+            }
+          }
+        }
+        for (int r2 : touched_rows) hit_cnt[r2] = 0;
+        if (bad_j) {
+          drop_col(j);
+          again = true;
+        }
+      }
+      if (again) continue;
+    }
     // partition row inside partition row
     for (int r1 = 0; r1 < m; ++r1) {
       if (!part(r1) || rsize[r1] == 0) continue;
