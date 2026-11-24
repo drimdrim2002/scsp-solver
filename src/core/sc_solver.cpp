@@ -148,6 +148,25 @@ class Worker {
     dec.assign(n, 0);
     insol.assign(n, 0);
     usage.assign(ns, 0.0);
+    if (ns > 0) {
+      side_avg_a.assign(static_cast<size_t>(ns), 1.0);
+      std::vector<double> sum_a(static_cast<size_t>(ns), 0.0);
+      std::vector<int> cnt_a(static_cast<size_t>(ns), 0);
+      for (int j = 0; j < n; ++j) {
+        for (int q = P.cs_ptr[j]; q < P.cs_ptr[j + 1]; ++q) {
+          if (P.cs_val[q] > 0.0) {
+            const int t = P.cs_row[q];
+            sum_a[static_cast<size_t>(t)] += P.cs_val[q];
+            ++cnt_a[static_cast<size_t>(t)];
+          }
+        }
+      }
+      for (int t = 0; t < ns; ++t) {
+        if (cnt_a[static_cast<size_t>(t)] > 0)
+          side_avg_a[static_cast<size_t>(t)] =
+              std::max(1e-6, sum_a[static_cast<size_t>(t)] / cnt_a[static_cast<size_t>(t)]);
+      }
+    }
   }
 
   bool want_help_tree() const {
@@ -167,8 +186,11 @@ class Worker {
       return false;
     }
     // Keep worker 0 on the heuristic longest; enlist worker 1 first, then worker 3 (and others).
-    if (id == 1) return stall >= 0.8 || gap < 0.02 || close_int;
-    if (id != 0) return stall >= 1.8 || gap < 0.015 || close_int;
+    // On wide side-constrained models (DMS n >= 15000), avoid pulling heuristic workers off primal search
+    // too early when gap is still ~1-2% so both primal quality and solo B&B bound progress stay strong.
+    const bool wide_dms = ns > 0 && n >= 15000;
+    if (id == 1) return wide_dms ? (stall >= 2.5 || gap < 0.008 || close_int) : (stall >= 0.8 || gap < 0.02 || close_int);
+    if (id != 0) return wide_dms ? (stall >= 4.0 || gap < 0.005 || close_int) : (stall >= 1.8 || gap < 0.015 || close_int);
     return stall >= 3.5 && (gap < 0.01 || close_int);
   }
 
@@ -196,8 +218,9 @@ class Worker {
     // acts as a Yagiura-Kishida-Ibaraki 3-flip + dynamic-row-weight specialist once root candidates
     // exist, refreshing Lagrangian diversity every 4th pass.
     const bool wls_specialist =
-        (ns == 0 && (id == 2 || (id == 0 && S.opt.tree_giveup == 0.0)) && pass_no >= 1 && have_root &&
-         S.opt.local_search && S.ub.load() < INF && !want_help_tree());
+        (ns == 0 &&
+         (id == 2 || (id == 3 && S.team.active()) || (id == 0 && S.opt.tree_giveup == 0.0)) &&
+         pass_no >= 1 && have_root && S.opt.local_search && S.ub.load() < INF && !want_help_tree());
     if (wls_specialist && (pass_no % 4 != 0)) {
       unfix_all();
       apply_rc_fix();
@@ -244,8 +267,10 @@ class Worker {
       // For side-constrained SC (ns > 0, e.g. DMS), run side-penalized WLS (wls_step) on worker 2
       // (or alternating on worker 0) plus exact 2/3-flip polish on worker 0.
       if (ns > 0 && S.opt.local_search && !S.timeup() && !want_help_tree() && !rc_col.empty()) {
-        if (id == 2 || (id == 0 && n < 15000 && (pass_no & 1) == 1)) {
-          const double wb = (n >= 15000) ? 0.15 : std::min(0.08, std::max(0.02, 0.35 * budget));
+        if ((id == 2 && (n < 40000 || (pass_no & 1) == 1)) ||
+            (id == 3 && S.team.active() && (n < 40000 || (pass_no & 1) == 1)) ||
+            (id == 0 && n < 15000 && (pass_no & 1) == 1)) {
+          const double wb = (n >= 15000) ? 0.12 : std::min(0.08, std::max(0.02, 0.35 * budget));
           lns_improved |= wls_step(wb);
         }
         if (id == 0 && !S.timeup() && !want_help_tree()) {
@@ -332,7 +357,7 @@ class Worker {
   std::vector<int> rc_ptr, rc_col, urows;
   std::vector<char> umark;
   std::vector<double> min_row_cost;
-  std::vector<double> rw, rw_base, sw, sw_base, p_loss, p_gain, red_loss;
+  std::vector<double> rw, rw_base, sw, sw_base, side_avg_a, p_loss, p_gain, red_loss;
   std::vector<int> unc_list, unc_pos, cand_k, w_cov, w_tabu;
   std::vector<char> cand_mark;
   int wls_clock = 0;
@@ -1585,22 +1610,8 @@ class Worker {
     std::vector<int> dirty_t;
     if (ns > 0) {
       dirty_t.reserve(static_cast<size_t>(ns));
-      std::vector<double> sum_a(static_cast<size_t>(ns), 0.0);
-      std::vector<int> cnt_a(static_cast<size_t>(ns), 0);
-      for (int j = 0; j < n; ++j) {
-        for (int q = P.cs_ptr[j]; q < P.cs_ptr[j + 1]; ++q) {
-          if (P.cs_val[q] > 0.0) {
-            const int t = P.cs_row[q];
-            sum_a[static_cast<size_t>(t)] += P.cs_val[q];
-            ++cnt_a[static_cast<size_t>(t)];
-          }
-        }
-      }
       for (int t = 0; t < ns; ++t) {
-        const double avg_a =
-            cnt_a[static_cast<size_t>(t)] > 0
-                ? std::max(1e-6, sum_a[static_cast<size_t>(t)] / cnt_a[static_cast<size_t>(t)])
-                : 1.0;
+        const double avg_a = side_avg_a[static_cast<size_t>(t)];
         const double vr = t < static_cast<int>(v_root.size()) ? v_root[static_cast<size_t>(t)] : 0.0;
         sw_base[static_cast<size_t>(t)] = std::max(vr, std::max(1.0, avg_c / avg_a));
         sw[static_cast<size_t>(t)] = sw_base[static_cast<size_t>(t)] * (0.9 + 0.2 * rnd());
@@ -2307,7 +2318,7 @@ void run_hybrid(Shared& S, int id, bool with_worker, int reserve = -1) {
   long n_last = 0;
   int strikes = 0;
   bool skip_tree = false;
-  if (watched) o.root_time_limit = std::max(0.3, 0.04 * S.opt.time_limit);
+  if (watched) o.root_time_limit = std::max(0.5, 0.08 * S.opt.time_limit);
   const double t_lp0 = S.elapsed();
   if (watched || DEBUG_TREE) {
     const auto root0 = H.root;
@@ -2329,13 +2340,18 @@ void run_hybrid(Shared& S, int id, bool with_worker, int reserve = -1) {
                      t_lp, left_cols, P.n, nodes, min_nodes, skip_tree ? "no tree" : "tree");
     };
     H.keep = [&](double bound, long nodes) {
-      if (skip_tree) return false;
       const double now = S.elapsed();
+      const double thr = S.thr();
+      // With >= 4 threads, keep this single B&B thread alive in solo bound-improvement mode
+      // (with tree_worth_helping == false so the other 3 workers remain 100% on heuristics/WLS)
+      // instead of abandoning lower-bound progress entirely once an incumbent exists.
+      const bool solo_keep = S.opt.threads >= 4 && (thr < INF || now < 0.15 * S.opt.time_limit);
+      if (skip_tree) return solo_keep;
       if (t_tree < 0.0) {
         t_tree = now;
         t_check = std::max(0.25, 0.01 * S.opt.time_limit);
       }
-      const double t = now - t_tree, thr = S.thr(), z = S.lp_bound;
+      const double t = now - t_tree, z = S.lp_bound;
       if (thr == INF) return true;
       const double f = thr - z > 1e-12 ? std::min(1.0, std::max(0.0, (bound - z) / (thr - z))) : 1.0;
       if (DEBUG_TREE && t >= t_log) {
@@ -2346,7 +2362,7 @@ void run_hybrid(Shared& S, int id, bool with_worker, int reserve = -1) {
       const double left = S.opt.time_limit - now;
       if (nodes - n_last < 20 && t - t_last < std::max(1.0, 0.15 * S.opt.time_limit)) {
         t_check = t * 1.25;
-        return !(nodes < 20 && t > std::max(1.0, 0.25 * S.opt.time_limit));
+        return solo_keep || !(nodes < 20 && t > std::max(1.0, 0.25 * S.opt.time_limit));
       }
       const double d = std::max(f - f_prev, 0.0);
       const double rest = d > 1e-12 ? (1.0 - f) / d * (t - t_last) : INF;  // time for the rest at the last interval's rate
@@ -2361,11 +2377,11 @@ void run_hybrid(Shared& S, int id, bool with_worker, int reserve = -1) {
       t_last = t;
       n_last = nodes;
       t_check = t * 2.0;
-      return strikes < 2;
+      return solo_keep || strikes < 2;
     };
   }
-  const double lp_estimate = 1.5e-8 * static_cast<double>(P.m + P.ns) * static_cast<double>(P.n);
-  const bool no_lp = watched && !P.integral && lp_estimate > 0.02 * S.opt.time_limit;
+  const double lp_estimate = 3.0e-9 * static_cast<double>(P.m + P.ns) * static_cast<double>(P.n);
+  const bool no_lp = watched && !P.integral && lp_estimate > 0.04 * S.opt.time_limit;
   if (DEBUG_TREE && no_lp) std::fprintf(stderr, "tree: root LP estimated at %.2f s, not started\n", lp_estimate);
   if (!S.timeup() && !no_lp) {
     S.bnb = branch_and_bound(L, H, o);
@@ -2537,6 +2553,10 @@ SolveResult solve_sc(const Problem& orig, const SolveOptions& opt, const std::ve
     res.node_fixed = S.bnb.node_fixed;
     res.rins_calls = S.bnb.rins_calls;
     res.rins_found = S.bnb.rins_found;
+    res.node_cuts = S.bnb.node_cuts;
+    res.node_cut_rounds = S.bnb.node_cut_rounds;
+    res.root_probed = S.bnb.root_probed;
+    res.learned_clauses = S.bnb.learned_clauses;
   }
   if (S.infeasible.load() && !have) {
     res.status = "infeasible";

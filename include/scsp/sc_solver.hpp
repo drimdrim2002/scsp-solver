@@ -57,6 +57,7 @@ struct SolveResult {
   int cuts = 0, cut_rounds = 0;
   double cut_time = 0.0;
   long long node_fixed = 0, rins_calls = 0, rins_found = 0;
+  long long node_cuts = 0, node_cut_rounds = 0, root_probed = 0, learned_clauses = 0;
 };
 
 // `warm`: optional feasible solution (original column indices). The returned

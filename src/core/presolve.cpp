@@ -168,6 +168,52 @@ PresolveResult presolve(const Problem& p, bool enable, double work_limit) {
           changed = true;
         }
       }
+    } else if (work < work_limit) {
+      // Mandatory side-capacity probing: if every alive column covering row i uses >= mu > 0 of
+      // side resource t, any column k not covering row i with a_{tk} + mu > rhs[t] is infeasible.
+      std::vector<double> col_a(n, 0.0);
+      std::vector<int> side_cols;
+      int ptick = 0;
+      std::vector<int> pmark(n, 0);
+      for (int t = 0; t < ns && work < work_limit; ++t) {
+        side_cols.clear();
+        double max_a = 0.0;
+        for (int j = 0; j < n; ++j) {
+          if (!calive[j]) continue;
+          for (int q = p.cs_ptr[j]; q < p.cs_ptr[j + 1]; ++q) {
+            if (p.cs_row[q] == t && p.cs_val[q] > 1e-9) {
+              col_a[j] = p.cs_val[q];
+              side_cols.push_back(j);
+              if (p.cs_val[q] > max_a) max_a = p.cs_val[q];
+              break;
+            }
+          }
+        }
+        if (side_cols.empty()) continue;
+        for (int i = 0; i < m && work < work_limit; ++i) {
+          if (!ralive[i]) continue;
+          double mu = std::numeric_limits<double>::infinity();
+          for (int q = p.row_ptr[i]; q < p.row_ptr[i + 1]; ++q) {
+            const int j = p.row_col[q];
+            if (!calive[j]) continue;
+            mu = std::min(mu, col_a[j]);
+            if (mu <= 1e-9) break;
+          }
+          if (mu <= 1e-9 || !std::isfinite(mu) || max_a + mu <= rhs[t] + 1e-9) continue;
+          ++ptick;
+          for (int q = p.row_ptr[i]; q < p.row_ptr[i + 1]; ++q)
+            if (calive[p.row_col[q]]) pmark[p.row_col[q]] = ptick;
+          work += static_cast<double>(side_cols.size());
+          for (int k : side_cols) {
+            if (calive[k] && pmark[k] != ptick && col_a[k] + mu > rhs[t] + 1e-9) {
+              calive[k] = 0;
+              out.rep[k] = -1;
+              changed = true;
+            }
+          }
+        }
+        for (int k : side_cols) col_a[k] = 0.0;
+      }
     }
 
     // pairwise column domination

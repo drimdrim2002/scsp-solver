@@ -37,10 +37,29 @@ struct SetRows {
   SetRows(const LpProblem& P, const std::vector<int>& cols);
 };
 
+// Nonnegative <= b knapsack rows (not pure unit packing rows) restricted to loaded columns (P8).
+struct KnapsackRows {
+  int nr = 0, nk = 0;
+  std::vector<int> rptr, rcol;       // row -> loaded columns
+  std::vector<double> rval, rhs;     // positive coefficients and finite upper bound
+  KnapsackRows(const LpProblem& P, const std::vector<int>& cols);
+};
+
 // x: LP values of the loaded columns. Cuts violated by more than min_viol are appended; returns how many.
 int separate_zero_half(const SetRows& R, const std::vector<double>& x, bool covering, int max_size, double min_viol,
                        int max_cuts, std::mt19937& rng, CutPool& out);
-int separate_cliques(const SetRows& R, const std::vector<double>& x, double min_viol, int max_cuts, CutPool& out);
+// Generalized Chvatal-Gomory {0, 1/d} covering cuts (d >= 3) over covering rows (Caprara & Fischetti 1996).
+int separate_cg_cover(const SetRows& R, const std::vector<double>& x, int denom, int max_size, double min_viol,
+                      int max_cuts, std::mt19937& rng, CutPool& out);
+// Clique cuts from packing rows plus optional learned binary conflicts (x_a + x_b <= 1, Atamturk et al. 2000).
+int separate_cliques(const SetRows& R, const std::vector<double>& x, double min_viol, int max_cuts, CutPool& out,
+                     const std::vector<std::vector<int>>* extra_conf = nullptr);
+// Lifted 0-1 knapsack cover inequalities (Balas 1975; Gu, Nemhauser & Savelsbergh 1998).
+int separate_knapsack_covers(const KnapsackRows& K, const std::vector<double>& x, double min_viol, int max_cuts,
+                             CutPool& out);
+// Single-row c-MIR inequalities on knapsack constraints (Marchand & Wolsey 2001).
+int separate_knapsack_mir(const KnapsackRows& K, const std::vector<double>& x, double min_viol, int max_cuts,
+                          CutPool& out);
 // Gomory mixed-integer (GMI) cuts from simplex tableau rows of fractional basic binary variables
 // (Gomory 1960; Balas, Ceria, Cornuejols & Natraj 1996).
 // row_int[i] == 1 iff row i of `lp` has all integer coefficients (so its row activity is integer).

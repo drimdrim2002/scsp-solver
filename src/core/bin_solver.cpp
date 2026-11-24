@@ -450,6 +450,12 @@ SolveResult solve_core(const LpProblem& L, const SolveOptions& opt, const std::v
   res.cut_rounds = r.cut_rounds;
   res.cut_time = r.cut_time;
   res.node_fixed = r.node_fixed;
+  res.rins_calls = r.rins_calls;
+  res.rins_found = r.rins_found;
+  res.node_cuts = r.node_cuts;
+  res.node_cut_rounds = r.node_cut_rounds;
+  res.root_probed = r.root_probed;
+  res.learned_clauses = r.learned_clauses;
   res.passes = lns_calls;      // neighbourhood searches run
   res.ls_moves = lns_improved;  // ... that found a better solution
   res.runtime = elapsed();
@@ -685,6 +691,48 @@ BinPresolve presolve_bin(const LpProblem& L) {
         ra[r2] = 0;  // the same columns as r1 now
         Q.changed = true;
         again = true;
+      }
+    }
+    // Size-2 partitioning row common-conflict elimination (x_a + x_b = 1):
+    // any column c conflicting with both a and b cannot be chosen (x_c = 0).
+    if (!again && m <= 3000 && n <= 30000) {
+      long work2 = 0;
+      for (int r = 0; r < m && work2 < 2000000L; ++r) {
+        if (!part(r) || rsize[r] != 2) continue;
+        int ab[2] = {-1, -1}, ac = 0;
+        for (int q = rptr[r]; q < rptr[r + 1] && ac < 2; ++q)
+          if (ca[rcol[q]]) ab[ac++] = rcol[q];
+        if (ac != 2) continue;
+        const int a = ab[0], b = ab[1];
+        ++tick;
+        for (int q = L.cptr[a]; q < L.cptr[a + 1]; ++q) {
+          const int ri = L.cidx[q];
+          if (!ra[ri] || rup[ri] > 1.0 + 1e-9 || L.cval[q] < 1.0 - 1e-9) continue;
+          for (int s = rptr[ri]; s < rptr[ri + 1]; ++s) {
+            const int c = rcol[s];
+            if (ca[c] && c != a && c != b) stamp[c] = tick;
+            ++work2;
+          }
+        }
+        std::vector<int> kill;
+        for (int q = L.cptr[b]; q < L.cptr[b + 1]; ++q) {
+          const int ri = L.cidx[q];
+          if (!ra[ri] || rup[ri] > 1.0 + 1e-9 || L.cval[q] < 1.0 - 1e-9) continue;
+          for (int s = rptr[ri]; s < rptr[ri + 1]; ++s) {
+            const int c = rcol[s];
+            if (ca[c] && c != a && c != b && stamp[c] == tick) {
+              stamp[c] = 0;
+              kill.push_back(c);
+            }
+            ++work2;
+          }
+        }
+        for (int c : kill)
+          if (ca[c]) {
+            drop_col(c);
+            Q.changed = true;
+            again = true;
+          }
       }
     }
   }

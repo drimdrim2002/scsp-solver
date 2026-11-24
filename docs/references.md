@@ -111,10 +111,12 @@ BKS 대조에서 나온 사실:
 | 루트 프로빙(contradiction·공통 함의 고정·이진 절 추출), CDCL 충돌 절 풀(`ConflictPool`, 이진 함의·watched literals, 원인 그래프 절 학습) 및 `presolve_bin` 1단계 충돌 프로빙 | `include/scsp/bnb.hpp`, `src/core/bnb.cpp` (`root_probing`, `ConflictPool`, `trace_conflict`), `src/core/bin_solver.cpp` (`presolve_bin`) | Achterberg 2007(MIP 충돌 분석); Atamtürk, Nemhauser & Savelsbergh 2000(충돌 그래프); Savelsbergh 1994(프로빙). 용량·차수 상한은 자체 구성 |
 | 광역 모델(`nk > 8000`) 트리 내 sifting·열 aging(활성 열 심플렉스 평가, 정확 축소 비용 pricing 후 가지치기, 콜드 열 주기적 퇴역) | `include/scsp/lp.hpp`, `src/core/lp.cpp` (`set_working_cols`, `price_inactive`), `src/core/bnb.cpp` (`ensure_priced`, `maybe_age_cols`) | Bixby et al. 1992(sifting); Forrest & Goldfarb 1992(DSE). 비활성 열 유지·복귀 규칙은 자체 구성 |
 | 부가 제약(`≤`) 동적 벌점 가중치(`sw`) 및 1-for-1 교환 복구(`repair_side`)를 포함한 통합 WLS(`wls_step`), 순수 SC 초기 휴리스틱 전담 배분 | `src/core/sc_solver.cpp` (`wls_step`, `want_help_tree`, `pass`) | Yagiura, Kishida & Ibaraki 2006(동적 가중치 타부 탐색). 부가 제약 적응 벌점 및 `repair_side` 복구는 자체 구성 |
+| 0-1 Knapsack Cover 컷(순서 무관 exact up-lifting) 및 단일 행 c-MIR 컷, 충돌 그래프 연동 Clique 컷, 일반화 `{0, 1/d}` 덮기 컷 | `include/scsp/cuts.hpp`, `src/core/cuts.cpp` (`KnapsackRows`, `separate_knapsack_covers`, `separate_knapsack_mir`, `separate_cliques`, `separate_cg_cover`), `src/core/bnb.cpp` | Balas 1975; Gu, Nemhauser & Savelsbergh 1998(lifted cover); Marchand & Wolsey 2001(c-MIR); Atamtürk, Nemhauser & Savelsbergh 2000(충돌 그래프 clique); Caprara & Fischetti 1996(CG 컷) |
+| DMS 필수 용량 presolve 프로빙, 크기-2 분할 행 공통 충돌 제거 | `src/core/presolve.cpp`, `src/core/bin_solver.cpp` (`presolve_bin`) | Savelsbergh 1994(전처리 프로빙); Borndörfer 1998(SPP 전처리) |
 
-솔버 기법을 구현할 때마다 이 표에 한 줄씩 추가한다(P6~P7 반영, 2026-11-23).
+솔버 기법을 구현할 때마다 이 표에 한 줄씩 추가한다(P6~P8 반영, 2026-11-24).
 
-## 4. P2~P7에서 추가 인용한 문헌 (Crossref·출판사 기록 대조 완료)
+## 4. P2~P8에서 추가 인용한 문헌 (Crossref·출판사 기록 대조 완료)
 
 - Harris, P.M.J. (1973). Pivot selection methods of the Devex LP code. *Math. Programming* 5(1), 1–28. doi:10.1007/BF01580108
 - Markowitz, H.M. (1957). The elimination form of the inverse and its application to linear programming. *Management Science* 3(3), 255–269. doi:10.1287/mnsc.3.3.255
@@ -129,3 +131,6 @@ BKS 대조에서 나온 사실:
 - Balas, E., Ceria, S., Cornuéjols, G., Natraj, N. (1996). Gomory cuts revisited. *Operations Research Letters* 19(1), 1–9. doi:10.1016/0167-6377(96)00007-7
 - Achterberg, T. (2007). Conflict analysis in mixed integer programming. *Discrete Optimization* 4(1), 4–20. doi:10.1016/j.disopt.2006.10.006
 - Achterberg, T., Berthold, T. (2007). Improving the feasibility pump. *Discrete Optimization* 4(1), 77–86. doi:10.1016/j.disopt.2006.10.004
+- Balas, E. (1975). Facets of the knapsack polytope. *Math. Programming* 8(1), 146–164. doi:10.1007/BF01580440
+- Gu, Z., Nemhauser, G.L., Savelsbergh, M.W.P. (1998). Lifted cover inequalities for 0–1 integer programs: Computation. *INFORMS J. Computing* 10(4), 427–437. doi:10.1287/ijoc.10.4.427
+- Marchand, H., Wolsey, L.A. (2001). Aggregation and mixed integer rounding to solve MIPs. *Operations Research* 49(3), 363–371. doi:10.1287/opre.49.3.363.11211

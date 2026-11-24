@@ -75,6 +75,10 @@ py::dict result_dict(const scsp::SolveResult& r) {
   st["node_fixed"] = r.node_fixed;
   st["rins_calls"] = r.rins_calls;
   st["rins_found"] = r.rins_found;
+  st["node_cuts"] = r.node_cuts;
+  st["node_cut_rounds"] = r.node_cut_rounds;
+  st["root_probed"] = r.root_probed;
+  st["learned_clauses"] = r.learned_clauses;
   d["stats"] = st;
   return d;
 }

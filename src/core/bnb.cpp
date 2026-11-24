@@ -242,6 +242,10 @@ class Search {
         if (std::floor(P.cval[q]) != P.cval[q]) base_row_int[P.cidx[q]] = 0;
     }
     if (o.cuts & 7) set_rows = std::make_unique<const SetRows>(P, cols);
+    if (o.cuts & 15) {
+      auto kr = std::make_unique<KnapsackRows>(P, cols);
+      if (kr->nr > 0) knap_rows = std::move(kr);
+    }
     root_gfix.assign(nk, -1);
   }
 
@@ -339,16 +343,31 @@ class Search {
       }
     }
 
-    if (o.cuts && exact && !root_cuts()) {
-      R.gave_up = true;
-      R.lp_iters += lp0->iterations();
-      return STOPPED;
-    }
     if (exact && has_prop && nk > 0 && !stop()) {
       if (!root_probing()) {
         R.lp_iters += lp0 ? lp0->iterations() : 0;
         return EXHAUSTED;
       }
+      if ((o.cuts & 4) && set_rows && !conf_clauses.empty()) {
+        std::vector<std::vector<int>> adj(nk);
+        bool any = false;
+        for (const auto& cc : conf_clauses) {
+          if (cc.len == 2 && (cc.lits[0] & 1) == 0 && (cc.lits[1] & 1) == 0) {
+            const int a = cc.lits[0] >> 1, b = cc.lits[1] >> 1;
+            if (a != b) {
+              adj[a].push_back(b);
+              adj[b].push_back(a);
+              any = true;
+            }
+          }
+        }
+        if (any) root_bin_conf = std::move(adj);
+      }
+    }
+    if (o.cuts && exact && !root_cuts()) {
+      R.gave_up = true;
+      R.lp_iters += lp0->iterations();
+      return STOPPED;
     }
     if (exact && nk > 8000 && !stop()) {
       sift_target = std::min<int>(nk, std::max<int>(4 * P.m, 4000));
@@ -464,10 +483,13 @@ class Search {
   long nnz0 = 0;
   std::vector<char> base_row_int;
   std::unique_ptr<const SetRows> set_rows;
+  std::unique_ptr<const KnapsackRows> knap_rows;
+  std::vector<std::vector<int>> root_bin_conf;
   std::atomic<size_t> open_size{0};
   std::atomic<double> cached_gb{-INF};
   std::atomic<bool> rins_busy{false};
   std::atomic<long> rins_at{0};
+  std::atomic<double> rins_next_t{1.5};
   std::mutex rins_mu;
   double rins_time_acc = 0.0;
   long rins_lp_iters = 0;
@@ -581,7 +603,7 @@ class Search {
     std::vector<double> x, dnode, act, pairw;
     std::vector<int> order, chosen, touched_pairs;
     double last_thr = INF;
-    long sb_iters = 0, local_strong = 0, local_fixed = 0;
+    long sb_iters = 0, local_strong = 0, local_fixed = 0, local_nodes = 0;
     long local_conf_ver = 0;
     int bfs_tick = 0;
     bool has_clauses = false, had_thr_gfix = false, had_rc_lfix = false;
@@ -1142,7 +1164,7 @@ class Search {
           (!was_from_queue && depth > 2) || depth <= last_cut_depth ||
           S.node_cuts_off.load(std::memory_order_relaxed))
         return 0;
-      if (S.R.cuts == 0 && (S.o.cuts & 6) == 0 && S.P.m >= 400) return 0;
+      if (S.R.cuts == 0 && (S.o.cuts & 6) == 0 && !S.knap_rows && S.P.m >= 400) return 0;
       if (lp->rows() - S.base_rows >= 8) return 0;
       const long nnz_cap = std::min<long>(std::max<long>(S.nnz0 / 8, 800L), 2500L);
       if (local_cut_nnz >= nnz_cap) return 0;
@@ -1158,9 +1180,14 @@ class Search {
       const long max_len = std::min<long>(S.nk, std::max<long>(80L, 6L * avg_row));
       if (S.o.cuts & 8) separate_gmi(*lp, row_int, x, 0.02, 5, static_cast<int>(max_len), pool);
       if ((S.o.cuts & 7) && S.set_rows) {
-        if (S.o.cuts & 4) separate_cliques(*S.set_rows, x, 0.03, 5, pool);
+        if (S.o.cuts & 4)
+          separate_cliques(*S.set_rows, x, 0.03, 5, pool, S.root_bin_conf.empty() ? nullptr : &S.root_bin_conf);
         if (S.o.cuts & 1) separate_zero_half(*S.set_rows, x, true, std::min(S.o.cut_size, 11), 0.03, 5, cut_rng, pool);
         if (S.o.cuts & 2) separate_zero_half(*S.set_rows, x, false, std::min(S.o.cut_size, 11), 0.03, 5, cut_rng, pool);
+      }
+      if (S.knap_rows) {
+        separate_knapsack_covers(*S.knap_rows, x, 0.03, 4, pool);
+        separate_knapsack_mir(*S.knap_rows, x, 0.03, 4, pool);
       }
       std::vector<int> rptr, ridx, sel_len;
       std::vector<double> rval, rlo, rup;
@@ -1320,6 +1347,7 @@ class Search {
       }
       const long nn = S.total_nodes.load(std::memory_order_relaxed);
       S.rins_at.store(std::max<long>(20, nn * (improved ? 4 : 8)), std::memory_order_relaxed);
+      S.rins_next_t.store(S.now() + (improved ? 1.5 : 3.5), std::memory_order_relaxed);
     }
 
     // Exact cover search for pure partitioning problems, without LPs (safe to run concurrently).
@@ -1693,13 +1721,19 @@ class Search {
           cpc[i] = {S.pcs[0][k], S.pcs[1][k], S.pcn[0][k], S.pcn[1][k]};
         }
       }
-      const bool large_model = S.nk > 8000 || (S.P.m >= 500 && S.nk > 4000);
+      const int cur_m = lp->rows();
+      const long avg_it = local_nodes >= 16 ? lp->iterations() / local_nodes : 0;
+      const bool heavy_lp = cur_m >= 350 || avg_it >= 250;
+      const bool large_model = S.nk > 8000 || (cur_m >= 500 && S.nk > 3000) || heavy_lp;
       const int sb_cands = large_model ? (cur.depth <= 2 ? 6 : 4) : S.o.strong_cands;
-      const long sb_iter_lim = (S.nk > 20000 || S.P.m >= 1000)
-                                   ? std::min(S.o.strong_iters, 50L)
-                                   : (S.nk > 8000 ? std::min(S.o.strong_iters, 75L) : S.o.strong_iters);
+      const long sb_iter_lim =
+          (S.nk > 20000 || cur_m >= 1000)
+              ? std::min(S.o.strong_iters, 50L)
+              : (S.nk > 8000 || heavy_lp ? std::min(S.o.strong_iters, avg_it >= 400 ? 45L : 65L) : S.o.strong_iters);
+      const int sb_free_depth = heavy_lp ? 4 : 8;
       const bool may_strong = sb_cands > 0 &&
-                              (cur.depth <= 8 || sb_iters < S.o.strong_share * static_cast<double>(lp->iterations()));
+                              (cur.depth <= sb_free_depth ||
+                               sb_iters < S.o.strong_share * static_cast<double>(lp->iterations()));
       const double cut = thr == INF ? INF : thr + S.P.offset + 1e-9 * std::max(1.0, std::fabs(thr));
       LpSolver::State node_state;
       bool saved = false;
@@ -2066,6 +2100,7 @@ class Search {
         const double cut_val = thr == INF ? INF : thr + P.offset + 1e-9 * std::max(1.0, std::fabs(thr));
         LpSolver::Status st = W.lp->solve(cut_val);
         const long nodes_now = ++total_nodes;
+        ++W.local_nodes;
         bool lp_priced = !W.lp->has_inactive_cols();
         double z = (st == LpSolver::OPTIMAL) ? (W.lp->obj() - P.offset) : -INF;
         if (!lp_priced && (st == LpSolver::INFEASIBLE || st == LpSolver::CUTOFF || was_from_queue || cur.depth <= 2 ||
@@ -2118,7 +2153,9 @@ class Search {
         if (tightened || !W.dirty_rows.empty()) {
           if (!W.propagate(false)) break;
         }
-        if (o.rins && exact && thr < INF && nodes_now >= rins_at.load(std::memory_order_relaxed) &&
+        if (o.rins && exact && thr < INF &&
+            (nodes_now >= rins_at.load(std::memory_order_relaxed) ||
+             (nodes_now >= 8 && now() >= rins_next_t.load(std::memory_order_relaxed))) &&
             rins_time_sec() < 0.08 * now() + 0.01 * o.time_limit) {
           if (!rins_busy.exchange(true, std::memory_order_acq_rel)) {
             W.rins();
@@ -2278,15 +2315,24 @@ class Search {
       return true;
     };
 
-    // Phase 1: combinatorial cuts (cliques + zero-half).
-    if ((o.cuts & 7) && set_rows) {
+    // Phase 1: combinatorial cuts (cliques + zero-half + generalized {0,1/3} SC cuts + knapsack cover/MIR).
+    if (((o.cuts & 7) && set_rows) || knap_rows) {
       for (int round = 0; round < o.cut_rounds && !stop() && now() < t_end; ++round) {
         lp0->get_x(x);
         pool.clear();
         const int cap = std::max(20, P.m / 4);
-        if (o.cuts & 4) separate_cliques(*set_rows, x, 0.02, cap, pool);
-        if (o.cuts & 1) separate_zero_half(*set_rows, x, true, o.cut_size, 0.02, cap, rng, pool);
-        if (o.cuts & 2) separate_zero_half(*set_rows, x, false, o.cut_size, 0.02, cap, rng, pool);
+        if ((o.cuts & 7) && set_rows) {
+          if (o.cuts & 4)
+            separate_cliques(*set_rows, x, 0.02, cap, pool, root_bin_conf.empty() ? nullptr : &root_bin_conf);
+          if (o.cuts & 1) separate_zero_half(*set_rows, x, true, o.cut_size, 0.02, cap, rng, pool);
+          if (o.cuts & 2) separate_zero_half(*set_rows, x, false, o.cut_size, 0.02, cap, rng, pool);
+          if ((o.cuts & 1) && (o.cuts & 6) == 0 && pool.size() < cap / 2)
+            separate_cg_cover(*set_rows, x, 3, std::min(o.cut_size, 10), 0.03, std::min(cap, 12), rng, pool);
+        }
+        if (knap_rows) {
+          separate_knapsack_covers(*knap_rows, x, 0.02, std::min(cap, 12), pool);
+          separate_knapsack_mir(*knap_rows, x, 0.02, std::min(cap, 12), pool);
+        }
         if (!select_and_add(cap, longest, 0.98, true)) break;
         if (stall >= 3 || round_up(z) > H.thr()) break;
       }
